@@ -87,6 +87,113 @@ final class AvitoAPIClient
         return $this->getStatsV2($itemIds, $dateFrom, $dateTo);
     }
 
+    /**
+     * Get a list of items with pagination.
+     *
+     * @param list<string> $statuses Filter by statuses (e.g. ['active'])
+     * @return array{resources?: list<array<string, mixed>>, total?: int}
+     */
+    public function listItems(array $statuses = ['active'], int $page = 1, int $perPage = 50): array
+    {
+        $query = array_merge(
+            ['status' => implode(',', $statuses), 'per_page' => $perPage, 'page' => $page],
+            ['user_id' => $this->userId]
+        );
+
+        return $this->requestJson('GET', '/core/v1/items', $query);
+    }
+
+    /**
+     * Get ALL items (paginated) with a given status.
+     *
+     * @param list<string> $statuses
+     * @return list<array<string, mixed>>
+     */
+    public function getAllItems(array $statuses = ['active'], int $perPage = 100): array
+    {
+        $all = [];
+        $page = 1;
+        $totalFetched = 0;
+
+        do {
+            $result = $this->listItems($statuses, $page, $perPage);
+            $resources = $result['resources'] ?? [];
+
+            if ($resources === []) {
+                break;
+            }
+
+            $all = array_merge($all, $resources);
+            $totalFetched += count($resources);
+
+            $total = (int) ($result['total'] ?? 0);
+            if ($total === 0 || $totalFetched >= $total) {
+                break;
+            }
+
+            $page++;
+        } while (true);
+
+        return $all;
+    }
+
+    /**
+     * Get detailed information about a single item (includes views, contacts, etc.).
+     *
+     * @return array<string, mixed>
+     */
+    public function getItemDetail(int $itemId): array
+    {
+        return $this->requestJson('GET', sprintf('/core/v1/accounts/%s/items/%d', rawurlencode($this->userId), $itemId));
+    }
+
+    /**
+     * Count items by status.
+     *
+     * @return array<string, int>  e.g. ['active' => 12, 'draft' => 3]
+     */
+    public function countAllStatuses(): array
+    {
+        $counts = [];
+        $statuses = ['active', 'closed', 'draft', 'moderation', 'rejected', 'archived'];
+
+        foreach ($statuses as $status) {
+            try {
+                $result = $this->listItems([$status], 1, 1);
+                $counts[$status] = (int) ($result['total'] ?? 0);
+            } catch (\Throwable $e) {
+                $counts[$status] = 0;
+            }
+        }
+
+        return $counts;
+    }
+
+    /**
+     * Search for an item by its public number (e.g. "8012519823").
+     *
+     * @return array<string, mixed>|null
+     */
+    public function searchItemByNumber(string $number): ?array
+    {
+        try {
+            $result = $this->requestJson('GET', '/core/v1/items', [
+                'user_id' => $this->userId,
+                'id' => $number,
+                'per_page' => 1,
+            ]);
+
+            $resources = $result['resources'] ?? [];
+            if ($resources !== []) {
+                return $resources[0];
+            }
+
+            return null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
     /** @return array<string, mixed> */
     private function requestJson(string $method, string $path, ?array $json = null): array
     {
