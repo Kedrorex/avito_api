@@ -19,6 +19,23 @@ class ItemRepository
         $this->init();
     }
 
+    public function beginTransaction(): void
+    {
+        $this->pdo->beginTransaction();
+    }
+
+    public function commit(): void
+    {
+        $this->pdo->commit();
+    }
+
+    public function rollBack(): void
+    {
+        if ($this->pdo->inTransaction()) {
+            $this->pdo->rollBack();
+        }
+    }
+
     /**
      * Создать таблицы, если не существуют
      */
@@ -52,6 +69,9 @@ class ItemRepository
                 UNIQUE(physical_ad_id, date)
             )
         ");
+
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_physical_ads_avito_id ON physical_ads(avito_id)');
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_stats_physical_ad_date ON stats(physical_ad_id, date)');
     }
 
     /**
@@ -94,17 +114,27 @@ class ItemRepository
         return $row ?: null;
     }
 
+    /** Получить физическое объявление по локальному ID. */
+    public function getById(int $id): ?array
+    {
+        $stmt = $this->pdo->prepare('SELECT * FROM physical_ads WHERE id = :id');
+        $stmt->execute([':id' => $id]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+
     /**
      * Создать новое физическое объявление
      */
-    public function createPhysical(string $logicalKey, array $masterData = []): int
+    public function createPhysical(string $logicalKey, array $masterData = [], string $status = 'active'): int
     {
         $stmt = $this->pdo->prepare("
-            INSERT INTO physical_ads (logical_key, master_data)
-            VALUES (:key, :master_data)
+            INSERT INTO physical_ads (logical_key, status, master_data)
+            VALUES (:key, :status, :master_data)
         ");
         $stmt->execute([
             ':key' => $logicalKey,
+            ':status' => $status,
             ':master_data' => json_encode($masterData),
         ]);
         return (int) $this->pdo->lastInsertId();
@@ -159,26 +189,71 @@ class ItemRepository
      */
     public function syncFromApi(array $items): int
     {
-        $synced = 0;
-
+        $created = 0;
         foreach ($items as $item) {
-            $avitoId = (string) $item['id'];
-            $existing = $this->getByAvitoId($avitoId);
-
-            if ($existing) {
-                // Обновляем существующее
-                $this->updatePhysical((int) $existing['id'], [
-                    'status' => 'active',
-                    'published_at' => $existing['published_at'] ?: date('Y-m-d H:i:s'),
-                ]);
-            } else {
-                // Создаём новое
-                $this->createPhysical($item['logical_key'], $item['master_data']);
-                $synced++;
+            if ($this->upsertFromApiItem($item)) {
+                $created++;
             }
         }
 
-        return $synced;
+        return $created;
+    }
+
+    /**
+     * Создать или обновить локальную запись по данным списка объявлений Avito.
+     *
+     * @return bool true, если создана новая запись
+     */
+    public function upsertFromApiItem(array $item): bool
+    {
+        $avitoId = trim((string) ($item['id'] ?? ''));
+        if ($avitoId === '') {
+            throw new \InvalidArgumentException('Avito item must contain id.');
+        }
+
+        $existing = $this->getByAvitoId($avitoId);
+        $status = (string) ($item['status'] ?? 'active');
+        $publishedAt = $this->formatApiDate($item['created_at'] ?? null);
+        $logicalKey = 'avito:' . ((string) ($item['number'] ?: $avitoId));
+        $masterData = [
+            'title' => (string) ($item['title'] ?? ''),
+            'number' => (string) ($item['number'] ?? ''),
+            'price' => $item['price'] ?? null,
+            'category' => $item['category'] ?? [],
+            'location' => $item['location'] ?? ($item['address'] ?? null),
+            'url' => $item['url'] ?? null,
+            'created_at' => $item['created_at'] ?? null,
+            'updated_at' => $item['updated_at'] ?? null,
+        ];
+
+        // API списка (/core/v1/items) не возвращает "number" — только "id".
+        // Сохраняем id в master_data как fallback.
+        if ($masterData['number'] === '') {
+            $masterData['number'] = $avitoId;
+        }
+
+        if ($existing !== null) {
+            $this->updatePhysical((int) $existing['id'], [
+                'status' => $status,
+                'published_at' => $existing['published_at'] ?: $publishedAt,
+                'master_data' => $masterData,
+            ]);
+            return false;
+        }
+
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO physical_ads (logical_key, avito_id, status, published_at, master_data) '
+            . 'VALUES (:logical_key, :avito_id, :status, :published_at, :master_data)'
+        );
+        $stmt->execute([
+            ':logical_key' => $logicalKey,
+            ':avito_id' => $avitoId,
+            ':status' => $status,
+            ':published_at' => $publishedAt,
+            ':master_data' => json_encode($masterData, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+        ]);
+
+        return true;
     }
 
     /**
@@ -187,9 +262,16 @@ class ItemRepository
     public function saveStats(int $physicalAdId, array $stats): void
     {
         $stmt = $this->pdo->prepare("
-            INSERT OR REPLACE INTO stats
+            INSERT INTO stats
             (physical_ad_id, date, views, uniq_views, contacts, uniq_contacts, favorites, uniq_favorites)
             VALUES (:pad_id, :date, :views, :uniq_views, :contacts, :uniq_contacts, :favorites, :uniq_favorites)
+            ON CONFLICT(physical_ad_id, date) DO UPDATE SET
+                views = excluded.views,
+                uniq_views = excluded.uniq_views,
+                contacts = excluded.contacts,
+                uniq_contacts = excluded.uniq_contacts,
+                favorites = excluded.favorites,
+                uniq_favorites = excluded.uniq_favorites
         ");
 
         foreach ($stats as $stat) {
@@ -216,6 +298,19 @@ class ItemRepository
         ");
         $stmt->execute([':id' => $physicalAdId]);
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    private function formatApiDate(mixed $value): ?string
+    {
+        if (!is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        try {
+            return (new \DateTimeImmutable($value))->format('Y-m-d H:i:s');
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**

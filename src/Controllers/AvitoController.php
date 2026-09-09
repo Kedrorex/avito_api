@@ -41,7 +41,7 @@ class AvitoController
 
         // 1. Синхронизация с API
         echo "\n  --- Sync ---\n";
-        $items = $this->apiClient->getAllItems('active');
+        $items = $this->apiClient->getAllItems(['active']);
         $synced = $this->repository->syncFromApi($items);
         $active = $this->repository->getActive();
         echo "  Active ads in DB: " . count($active) . "\n";
@@ -109,7 +109,7 @@ class AvitoController
      */
     public function sync(): string
     {
-        $items = $this->apiClient->getAllItems('active');
+        $items = $this->apiClient->getAllItems(['active']);
         $synced = $this->repository->syncFromApi($items);
         $total = count($this->repository->getActive());
 
@@ -212,5 +212,81 @@ class AvitoController
             'status' => 'success',
             'data' => $detail,
         ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /** Собрать дневную статистику объявлений всех поддержанных статусов в SQLite. */
+    public function collectStatsToDatabase(int $days = 30): void
+    {
+        echo "Collecting statistics for advertisements of all supported statuses...\n";
+        $result = $this->republisher->collectAllActiveStats($days);
+
+        echo "\nCompleted\n";
+        echo "  Period:       {$result['date_from']} — {$result['date_to']}\n";
+        echo "  Loaded ads:   {$result['items']}\n";
+        echo "  New DB ads:   {$result['created']}\n";
+        echo "  Saved ads:    {$result['saved_items']}\n";
+        echo "  Failed batch: {$result['failed_batches']}\n";
+    }
+
+    /** Вывести объявление и сохранённую статистику из SQLite без обращения к Avito API. */
+    public function showStoredAd(int $identifier): void
+    {
+        $ad = $this->repository->getById($identifier);
+        $foundBy = 'local ID';
+        if ($ad === null) {
+            $ad = $this->repository->getByAvitoId((string) $identifier);
+            $foundBy = 'Avito ID';
+        }
+
+        if ($ad === null) {
+            echo "Advertisement {$identifier} was not found in SQLite.\n";
+            return;
+        }
+
+        $masterData = [];
+        if (!empty($ad['master_data'])) {
+            try {
+                $masterData = json_decode((string) $ad['master_data'], true, 512, JSON_THROW_ON_ERROR);
+            } catch (\Throwable) {
+                $masterData = [];
+            }
+        }
+        $stats = $this->repository->getStats((int) $ad['id']);
+        $totals = [
+            'views' => 0, 'uniq_views' => 0,
+            'contacts' => 0, 'uniq_contacts' => 0,
+            'favorites' => 0, 'uniq_favorites' => 0,
+        ];
+        foreach ($stats as $stat) {
+            foreach ($totals as $field => $_) {
+                $totals[$field] += (int) ($stat[$field] ?? 0);
+            }
+        }
+
+        echo "Advertisement in SQLite (found by {$foundBy})\n";
+        echo "  Local ID:     {$ad['id']}\n";
+        echo "  Avito ID:     " . ($ad['avito_id'] ?: '—') . "\n";
+        echo "  Number:       " . ($masterData['number'] ?? '—') . "\n";
+        echo "  Title:        " . ($masterData['title'] ?? '—') . "\n";
+        echo "  Status:       {$ad['status']}\n";
+        echo "  Published:    " . ($ad['published_at'] ?: '—') . "\n";
+        echo "  Statistics:   " . count($stats) . " day(s)\n";
+
+        if ($stats === []) {
+            return;
+        }
+
+        echo "  Period:       {$stats[0]['date']} — " . $stats[array_key_last($stats)]['date'] . "\n";
+        echo "  Totals: views={$totals['views']} (unique={$totals['uniq_views']}), "
+            . "contacts={$totals['contacts']} (unique={$totals['uniq_contacts']}), "
+            . "favorites={$totals['favorites']} (unique={$totals['uniq_favorites']})\n\n";
+        echo str_pad('Date', 12) . str_pad('Views', 9) . str_pad('Contacts', 11) . str_pad('Favorites', 10) . "\n";
+        echo str_repeat('-', 42) . "\n";
+        foreach ($stats as $stat) {
+            echo str_pad((string) $stat['date'], 12)
+                . str_pad((string) $stat['views'], 9)
+                . str_pad((string) $stat['contacts'], 11)
+                . str_pad((string) $stat['favorites'], 10) . "\n";
+        }
     }
 }

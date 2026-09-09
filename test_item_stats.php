@@ -58,15 +58,6 @@ if (!$item) {
     exit(1);
 }
 
-if (!$item) {
-    printFail("Item with number {$itemNumber} not found");
-    echo "\n  Possible reasons:\n";
-    echo "    - Item number is incorrect\n";
-    echo "    - Item does not belong to this account\n";
-    echo "    - Item has been deleted\n";
-    exit(1);
-}
-
 $itemId = (int) ($item['id'] ?? 0);
 printOk("Found item: ID={$itemId}");
 

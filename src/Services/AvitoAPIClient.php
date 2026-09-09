@@ -17,6 +17,7 @@ final class AvitoAPIClient
     private ?AccessTokenInterface $accessToken = null;
     private string $apiBaseUrl;
     private string $userId;
+    private int $listRequestDelaySeconds;
 
     /** @param array{client_id:string,client_secret:string,user_id:string,api_base_url?:string} $config */
     public function __construct(array $config)
@@ -25,6 +26,7 @@ final class AvitoAPIClient
         $clientSecret = trim((string) ($config['client_secret'] ?? ''));
         $this->userId = trim((string) ($config['user_id'] ?? ''));
         $this->apiBaseUrl = rtrim((string) ($config['api_base_url'] ?? 'https://api.avito.ru'), '/');
+        $this->listRequestDelaySeconds = max(1, (int) ceil((float) ($config['rate_limit_delay'] ?? 8)));
 
         if ($clientId === '' || $clientSecret === '') {
             throw new \RuntimeException('Set AVITO_CLIENT_ID and AVITO_CLIENT_SECRET in .env.');
@@ -109,7 +111,7 @@ final class AvitoAPIClient
      * @param list<string> $statuses
      * @return list<array<string, mixed>>
      */
-    public function getAllItems(array $statuses = ['active'], int $perPage = 100): array
+    public function getAllItems(array $statuses = ['active'], int $perPage = 100, ?callable $onPage = null): array
     {
         $all = [];
         $page = 1;
@@ -127,11 +129,20 @@ final class AvitoAPIClient
             $totalFetched += count($resources);
 
             $total = (int) ($result['total'] ?? 0);
-            if ($total === 0 || $totalFetched >= $total) {
+            if ($onPage !== null) {
+                $onPage($page, $totalFetched, $total);
+            }
+            // API не возвращает корректный total (всегда 0).
+            // Продолжаем, пока не получим пустую страницу.
+            // Прерываемся после 500 страниц (~50000 items) как защита от бесконечного цикла.
+            if ($page >= 500) {
                 break;
             }
 
             $page++;
+            // GET /core/v1/items ограничен 25 запросами в минуту.
+            // Используем ту же консервативную паузу, что и проверочный test_item.php.
+            sleep($this->listRequestDelaySeconds);
         } while (true);
 
         return $all;
@@ -199,8 +210,18 @@ final class AvitoAPIClient
     {
         $options = ['headers' => ['Accept' => 'application/json']];
         if ($json !== null) {
-            $options['headers']['Content-Type'] = 'application/json';
-            $options['body'] = json_encode($json, JSON_THROW_ON_ERROR);
+            if (strtoupper($method) === 'GET') {
+                // Параметры GET должны быть частью URL. Раньше они попадали в
+                // JSON-тело и Avito применял значения по умолчанию: page=1,
+                // per_page=25, status=active.
+                $query = http_build_query($json, '', '&', PHP_QUERY_RFC3986);
+                if ($query !== '') {
+                    $path .= '?' . $query;
+                }
+            } else {
+                $options['headers']['Content-Type'] = 'application/json';
+                $options['body'] = json_encode($json, JSON_THROW_ON_ERROR);
+            }
         }
 
         $request = $this->provider->getAuthenticatedRequest(

@@ -1,25 +1,63 @@
-# Avito item statistics CLI
+# Avito: сбор статистики объявлений
 
-The project uses [`avito/oauth2-avito`](https://packagist.org/packages/avito/oauth2-avito) to obtain a client-credentials OAuth token and authenticate Avito API requests.
+PHP-проект для получения объявлений и статистики из Avito API. Подтверждённый рабочий сценарий на текущем этапе — `test_item.php`: он получает активные объявления и дневную статистику по выбранным объявлениям. Следующий этап — сохранить этот результат в SQLite.
 
-## Setup
+## Быстрый старт
 
-Create `.env` in the project root:
+1. Установите зависимости:
 
-```dotenv
-AVITO_CLIENT_ID=your_client_id
-AVITO_CLIENT_SECRET=your_client_secret
-AVITO_USER_ID=your_avito_account_id
+   ```powershell
+   php composer.phar install
+   ```
+
+2. Создайте в корне файл `.env` (не добавляйте его в Git):
+
+   ```dotenv
+   AVITO_CLIENT_ID=your_client_id
+   AVITO_CLIENT_SECRET=your_client_secret
+   AVITO_USER_ID=your_avito_account_id
+   ```
+
+3. Проверьте рабочий запрос и получите статистику первых 10 активных объявлений:
+
+   ```powershell
+   php test_item.php
+   # либо ограничить число объявлений
+   php test_item.php 5
+   ```
+
+Скрипт намеренно делает паузы между запросами, чтобы не превысить лимиты API. Его запуск может занять несколько минут.
+
+## Документация
+
+- [Обзор проекта и текущего состояния](docs/ARCHITECTURE.md)
+- [Работа с SQLite](docs/SQLITE.md)
+- [Карта запросов к Avito API](maps.md) — историческая справка; перед использованием сверяйте с текущим `src/Services/AvitoAPIClient.php`.
+
+## Важное о базе данных
+
+Файл базы: `data/avito.db`. PDO SQLite уже доступен в используемой версии PHP. Тест `test_item.php` намеренно **не записывает** результаты в эту БД: он остаётся диагностическим сценарием для сравнения с импортом.
+
+## Сбор в SQLite и просмотр результатов
+
+Собрать статистику всех объявлений доступных в API статусов (`active`, `removed`, `old`, `blocked`, `rejected`) за последние 30 завершённых дней и сохранить её в `data/avito.db`:
+
+```powershell
+php index.php collect-stats
 ```
 
-Install dependencies with `php composer.phar install`.
+Можно указать период от 1 до 270 дней:
 
-## Get advertisement statistics
-
-Run the console interface and enter the advertisement number (Avito item ID) when prompted:
-
-```bash
-php bin/item-stats.php
+```powershell
+php index.php collect-stats 7
 ```
 
-The command prints the advertisement details and totals for views, contacts, and favorites for the last 30 complete days. API credentials are never printed.
+Список объявлений запрашивается постранично с паузой 8 секунд, а статистика — пакетами до 200 объявлений с паузой 10 секунд. Для 8 000 объявлений это около 80 запросов списка и 40 запросов статистики; повторный импорт периода обновляет строки за те же даты, а не создаёт дубликаты.
+
+Посмотреть сохранённое объявление и его дневную статистику без обращения к Avito API:
+
+```powershell
+php index.php ad 1234567890
+```
+
+Команда сначала ищет локальный ID SQLite, затем ID объявления Avito. В выводе указано, каким способом найдена запись.
