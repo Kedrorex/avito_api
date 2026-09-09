@@ -91,6 +91,124 @@ class RepublisherService
     }
 
     /**
+     * Получить из Avito объявления всех поддержанных статусов и сохранить дневную статистику.
+     *
+     * @return array{items:int, created:int, batches:int, saved_items:int, failed_batches:int, date_from:string, date_to:string}
+     */
+    public function collectAllActiveStats(int $days = 30): array
+    {
+        if ($days < 1 || $days > 270) {
+            throw new \InvalidArgumentException('Days must be between 1 and 270.');
+        }
+
+        // API возвращает только active, если не передать все статусы явно.
+        // Список взят из enum GET /core/v1/items в Swagger.
+        $statuses = $this->config['item_statuses'] ?? ['active', 'removed', 'old', 'blocked', 'rejected'];
+        echo "  Loading advertisement list...\n";
+        $items = $this->apiClient->getAllItems(
+            $statuses,
+            100,
+            static function (int $page, int $loaded, int $total): void {
+                $totalLabel = $total > 0 ? (string) $total : '?';
+                echo "  List page {$page}: {$loaded}/{$totalLabel} ads loaded\n";
+            }
+        );
+        $created = $this->repository->syncFromApi($items);
+        $dateTo = date('Y-m-d', strtotime('-1 day'));
+        $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
+        $delaySeconds = (int) ($this->config['stats_request_delay_seconds'] ?? 10);
+        $batches = array_chunk($items, 200);
+        $savedItems = 0;
+        $failedBatches = 0;
+
+        foreach ($batches as $batchNumber => $batch) {
+            $itemIds = array_values(array_filter(array_map(
+                static fn(array $item): int => (int) ($item['id'] ?? 0),
+                $batch
+            )));
+            if ($itemIds === []) {
+                continue;
+            }
+
+            $displayBatch = $batchNumber + 1;
+            echo "  Batch {$displayBatch}/" . count($batches) . ': ' . count($itemIds) . " ads...\n";
+
+            try {
+                $statsList = $this->requestStatsWithRetry($itemIds, $dateFrom, $dateTo, $displayBatch);
+                $statsByItemId = [];
+                foreach ($statsList as $statItem) {
+                    $itemId = (string) ($statItem['itemId'] ?? '');
+                    if ($itemId !== '') {
+                        $statsByItemId[$itemId] = $statItem['stats'] ?? [];
+                    }
+                }
+
+                $this->repository->beginTransaction();
+                try {
+                    foreach ($itemIds as $itemId) {
+                        $ad = $this->repository->getByAvitoId((string) $itemId);
+                        if ($ad === null || !isset($statsByItemId[(string) $itemId])) {
+                            continue;
+                        }
+                        $this->repository->saveStats((int) $ad['id'], $statsByItemId[(string) $itemId]);
+                        $savedItems++;
+                    }
+                    $this->repository->commit();
+                } catch (\Throwable $e) {
+                    $this->repository->rollBack();
+                    throw $e;
+                }
+            } catch (\Throwable $e) {
+                $failedBatches++;
+                fwrite(STDERR, "  [ERROR] Batch {$displayBatch}: {$e->getMessage()}\n");
+            }
+
+            // test_item.php подтвердил, что интервал 10 секунд между запросами
+            // статистики стабилен. Здесь один запрос обслуживает до 200 объявлений.
+            if ($batchNumber < count($batches) - 1 && $delaySeconds > 0) {
+                echo "  Waiting {$delaySeconds}s before next statistics request...\n";
+                sleep($delaySeconds);
+            }
+        }
+
+        return [
+            'items' => count($items),
+            'created' => $created,
+            'batches' => count($batches),
+            'saved_items' => $savedItems,
+            'failed_batches' => $failedBatches,
+            'date_from' => $dateFrom,
+            'date_to' => $dateTo,
+        ];
+    }
+
+    /** @param list<int> $itemIds @return list<array<string, mixed>> */
+    private function requestStatsWithRetry(array $itemIds, string $dateFrom, string $dateTo, int $batchNumber): array
+    {
+        $maxRetries = max(0, (int) ($this->config['max_retries'] ?? 3));
+        $retryDelay = max(1, (int) ($this->config['retry_delay_base'] ?? 60));
+
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                // Тот же вызов, что в test_item.php, но с допустимым API списком до 200 ID.
+                return $this->apiClient->getStatsV2($itemIds, $dateFrom, $dateTo, 'item');
+            } catch (\Throwable $e) {
+                if ($attempt >= $maxRetries) {
+                    throw $e;
+                }
+
+                $nextAttempt = $attempt + 2;
+                fwrite(
+                    STDERR,
+                    "  [WARN] Batch {$batchNumber} failed: {$e->getMessage()}. "
+                    . "Retry {$nextAttempt}/" . ($maxRetries + 1) . " in {$retryDelay}s...\n"
+                );
+                sleep($retryDelay);
+            }
+        }
+    }
+
+    /**
      * Найти объявления-кандидаты для републикации
      *
      * Критерии:
@@ -192,13 +310,14 @@ class RepublisherService
         ]);
 
         // 2. Создаём новое поколение
+        $masterData = $ad['master_data'] ? json_decode($ad['master_data'], true) : [];
         $newId = $this->repository->createPhysical(
             $ad['logical_key'],
-            $ad['master_data'] ? json_decode($ad['master_data'], true) : []
+            $masterData,
+            'active'
         );
 
         $this->repository->updatePhysical($newId, [
-            'status' => 'active',
             'published_at' => date('Y-m-d H:i:s'),
             'old_avito_id' => $avitoId ?: null,
         ]);

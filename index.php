@@ -89,6 +89,22 @@ if ($cli) {
             $dateTo = $argv[3] ?? date('Y-m-d', strtotime('-1 day'));
             echo $controller->getStats($dateFrom, $dateTo) . "\n";
             break;
+        case 'collect-stats':
+            $days = isset($argv[2]) ? (int) $argv[2] : 30;
+            if ($days < 1 || $days > 270) {
+                echo "Usage: php index.php collect-stats [days: 1..270]\n";
+                exit(1);
+            }
+            $controller->collectStatsToDatabase($days);
+            break;
+        case 'ad':
+            $identifier = $argv[2] ?? null;
+            if (!is_string($identifier) || !preg_match('/^[1-9][0-9]*$/', $identifier)) {
+                echo "Usage: php index.php ad <local_or_avito_id>\n";
+                exit(1);
+            }
+            $controller->showStoredAd((int) $identifier);
+            break;
         case 'item':
             $itemId = $argv[2] ?? null;
             if (!$itemId) {
@@ -99,7 +115,7 @@ if ($cli) {
             break;
         default:
             echo "Unknown command: {$command}\n";
-            echo "Available: run, sync, active, status-counts, republish, stats, item\n";
+            echo "Available: run, sync, active, status-counts, republish, stats, item, collect-stats, ad\n";
             exit(1);
     }
 } else {
