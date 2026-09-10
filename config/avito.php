@@ -26,16 +26,19 @@ return [
 
         // Retry settings
         'max_retries'       => 3,
-        'retry_delay_base'  => 60, // секунды для ConnectionResetError
+        'retry_delay_base'  => 65, // секунды для ConnectionResetError
 
         // Stats
         'stats_fields' => [
             'views', 'uniqViews',
             'contacts', 'uniqContacts',
             'favorites', 'uniqFavorites',
+            'contactsShowPhone',
+            'contactsMessenger',
         ],
-        // Пауза между пакетными запросами статистики (до 200 объявлений в пакете)
-        'stats_request_delay_seconds' => 10,
+        // Пауза между пакетными запросами статистики
+        // API: 1 запрос в минуту → 65 сек как запас
+        'stats_request_delay_seconds' => 65,
 
         // Republisher settings
         'max_daily_repub'   => 70,

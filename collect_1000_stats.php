@@ -7,7 +7,7 @@
  * 2. Сохраняем/обновляем их в physical_ads
  * 3. Разбиваем на пакеты по 200
  * 4. Для каждого пакета запрашиваем статистику за N дней
- * 5. Сохраняем в stats с транзакцией
+ * 5. Сохраняем в statistics_YYYY_MM с транзакцией
  *
  * Запуск:
  *   php collect_1000_stats.php [days]
@@ -120,11 +120,12 @@ $dateTo = date('Y-m-d', strtotime('-1 day'));
 $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
 echo "\n  Period: {$dateFrom} — {$dateTo}\n";
 
-$delaySeconds = (int) ($config['avito']['stats_request_delay_seconds'] ?? 10);
+$delaySeconds = (int) ($config['avito']['stats_request_delay_seconds'] ?? 65);
 $maxRetries = (int) ($config['avito']['max_retries'] ?? 3);
-$retryDelay = (int) ($config['avito']['retry_delay_base'] ?? 60);
+$retryDelay = (int) ($config['avito']['retry_delay_base'] ?? 65);
 
-$batches = array_chunk($allItems, 200);
+// Пакеты по 1000 (максимум API для stats)
+$batches = array_chunk($allItems, 1000);
 $totalBatches = count($batches);
 $savedItems = 0;
 $failedBatches = 0;
@@ -184,13 +185,21 @@ foreach ($batches as $batchNumber => $batch) {
             if ($ad === null) {
                 continue;
             }
+
+            // Получаем price из master_data
+            $price = 0;
+            if (!empty($ad['master_data'])) {
+                $masterData = json_decode($ad['master_data'], true);
+                $price = (int) ($masterData['price'] ?? 0);
+            }
+
             if (!isset($statsByItemId[(string) $itemId]) || $statsByItemId[(string) $itemId] === []) {
                 // Сохраняем пустую статистику — это нормально для новых объявлений
-                $repo->saveStats((int) $ad['id'], []);
+                $repo->saveStats((int) $ad['id'], [], $price);
                 $batchSaved++;
                 continue;
             }
-            $repo->saveStats((int) $ad['id'], $statsByItemId[(string) $itemId]);
+            $repo->saveStats((int) $ad['id'], $statsByItemId[(string) $itemId], $price);
             $batchSaved++;
             $totalStatsRecords += count($statsByItemId[(string) $itemId]);
         }
@@ -227,8 +236,17 @@ $totalStats = $pdo->query('SELECT COUNT(*) FROM stats')->fetchColumn();
 $adsWithStats = $pdo->query('SELECT COUNT(DISTINCT physical_ad_id) FROM stats')->fetchColumn();
 
 echo "    physical_ads total:   {$totalInDb}\n";
-echo "    stats rows total:     {$totalStats}\n";
-echo "    ads with stats:       {$adsWithStats}\n";
+echo "    stats rows (old):     {$totalStats}\n";
+echo "    ads with stats (old): {$adsWithStats}\n";
+
+// Проверяем секции
+$partitionCount = (int) $pdo->query("SELECT COUNT(*) FROM stats_meta")->fetchColumn();
+echo "    partitions created:   {$partitionCount}\n";
+
+if ($partitionCount > 0) {
+    $partitionStats = $pdo->query("SELECT SUM(record_count) FROM stats_meta")->fetchColumn();
+    echo "    partition records:    {$partitionStats}\n";
+}
 
 echo "\n" . str_repeat('=', 80) . "\n";
 echo "  DONE\n";

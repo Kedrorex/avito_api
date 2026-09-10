@@ -37,7 +37,10 @@ class ItemRepository
     }
 
     /**
-     * Создать таблицы, если не существуют
+     * Создать таблицы, если не существуют.
+     *
+     * Обратная совместимость: старая таблица stats сохраняется.
+     * getStats() читает из обеих (старой + секций).
      */
     private function init(): void
     {
@@ -54,6 +57,7 @@ class ItemRepository
             )
         ");
 
+        // Старая таблица stats — оставляем для обратной совместимости
         $this->pdo->exec("
             CREATE TABLE IF NOT EXISTS stats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,8 +74,19 @@ class ItemRepository
             )
         ");
 
+        // Метаданные секций
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS stats_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                partition_name TEXT NOT NULL UNIQUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                record_count INTEGER DEFAULT 0
+            )
+        ");
+
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_physical_ads_avito_id ON physical_ads(avito_id)');
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_stats_physical_ad_date ON stats(physical_ad_id, date)');
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_stats_meta_partition ON stats_meta(partition_name)');
     }
 
     /**
@@ -214,7 +229,7 @@ class ItemRepository
         $existing = $this->getByAvitoId($avitoId);
         $status = (string) ($item['status'] ?? 'active');
         $publishedAt = $this->formatApiDate($item['created_at'] ?? null);
-        $logicalKey = 'avito:' . ((string) ($item['number'] ?: $avitoId));
+        $logicalKey = 'avito:' . ((string) ($item['number'] ?? '' ?: $avitoId));
         $masterData = [
             'title' => (string) ($item['title'] ?? ''),
             'number' => (string) ($item['number'] ?? ''),
@@ -257,46 +272,356 @@ class ItemRepository
     }
 
     /**
-     * Сохранить статистику для объявления
+     * Сохранить статистику для объявления в секцию по месяцу.
+     *
+     * @param int   $physicalAdId ID объявления в physical_ads
+     * @param array $stats        массив ['date' => 'Y-m-d', ...]
+     * @param int   $price        текущая цена объявления
      */
-    public function saveStats(int $physicalAdId, array $stats): void
+    public function saveStats(int $physicalAdId, array $stats, int $price = 0): void
     {
-        $stmt = $this->pdo->prepare("
-            INSERT INTO stats
-            (physical_ad_id, date, views, uniq_views, contacts, uniq_contacts, favorites, uniq_favorites)
-            VALUES (:pad_id, :date, :views, :uniq_views, :contacts, :uniq_contacts, :favorites, :uniq_favorites)
-            ON CONFLICT(physical_ad_id, date) DO UPDATE SET
-                views = excluded.views,
-                uniq_views = excluded.uniq_views,
-                contacts = excluded.contacts,
-                uniq_contacts = excluded.uniq_contacts,
-                favorites = excluded.favorites,
-                uniq_favorites = excluded.uniq_favorites
-        ");
-
+        // Группируем записи по месяцам
+        $byPartition = [];
         foreach ($stats as $stat) {
-            $stmt->execute([
-                ':pad_id' => $physicalAdId,
-                ':date' => $stat['date'],
-                ':views' => (int) ($stat['views'] ?? 0),
-                ':uniq_views' => (int) ($stat['uniqViews'] ?? 0),
-                ':contacts' => (int) ($stat['contacts'] ?? 0),
-                ':uniq_contacts' => (int) ($stat['uniqContacts'] ?? 0),
-                ':favorites' => (int) ($stat['favorites'] ?? 0),
-                ':uniq_favorites' => (int) ($stat['uniqFavorites'] ?? 0),
-            ]);
+            $date = $stat['date'] ?? '';
+            if ($date === '') {
+                continue;
+            }
+            $partitionName = $this->getPartitionName($date);
+            $byPartition[$partitionName][] = $stat;
+        }
+
+        foreach ($byPartition as $partitionName => $partitionStats) {
+            $this->ensurePartitionExists($partitionName);
+
+            $stmt = $this->pdo->prepare("
+                INSERT INTO {$partitionName}
+                (physical_ad_id, date, views, uniq_views, contacts, uniq_contacts,
+                 favorites, uniq_favorites, phone_shows, chats, price)
+                VALUES (:pad_id, :date, :views, :uniq_views, :contacts, :uniq_contacts,
+                        :favorites, :uniq_favorites, :phone_shows, :chats, :price)
+                ON CONFLICT(physical_ad_id, date) DO UPDATE SET
+                    views = excluded.views,
+                    uniq_views = excluded.uniq_views,
+                    contacts = excluded.contacts,
+                    uniq_contacts = excluded.uniq_contacts,
+                    favorites = excluded.favorites,
+                    uniq_favorites = excluded.uniq_favorites,
+                    phone_shows = excluded.phone_shows,
+                    chats = excluded.chats,
+                    price = excluded.price
+            ");
+
+            foreach ($partitionStats as $stat) {
+                $stmt->execute([
+                    ':pad_id' => $physicalAdId,
+                    ':date' => $stat['date'],
+                    ':views' => (int) ($stat['views'] ?? 0),
+                    ':uniq_views' => (int) ($stat['uniqViews'] ?? 0),
+                    ':contacts' => (int) ($stat['contacts'] ?? 0),
+                    ':uniq_contacts' => (int) ($stat['uniqContacts'] ?? 0),
+                    ':favorites' => (int) ($stat['favorites'] ?? 0),
+                    ':uniq_favorites' => (int) ($stat['uniqFavorites'] ?? 0),
+                    ':phone_shows' => (int) ($stat['contactsShowPhone'] ?? 0),
+                    ':chats' => (int) ($stat['contactsMessenger'] ?? 0),
+                    ':price' => $price,
+                ]);
+            }
+
+            // Обновляем record_count в stats_meta (общий count для секции)
+            $count = $this->pdo->query(
+                "SELECT COUNT(*) FROM {$partitionName}"
+            )->fetchColumn();
+            $this->pdo->prepare(
+                "UPDATE stats_meta SET record_count = :cnt WHERE partition_name = :name"
+            )->execute([':cnt' => (int) $count, ':name' => $partitionName]);
         }
     }
 
     /**
-     * Получить статистику для объявления
+     * Получить статистику для объявления.
+     *
+     * Читает из секций + старой таблицы stats для обратной совместимости.
      */
-    public function getStats(int $physicalAdId): array
+    public function getStats(int $physicalAdId, ?string $dateFrom = null, ?string $dateTo = null): array
     {
-        $stmt = $this->pdo->prepare("
-            SELECT * FROM stats WHERE physical_ad_id = :id ORDER BY date
+        $allStats = [];
+
+        // Читаем из секций
+        if ($dateFrom !== null && $dateTo !== null) {
+            $partitions = $this->getPartitionNamesForPeriod($dateFrom, $dateTo);
+        } else {
+            $stmt = $this->pdo->query("SELECT partition_name FROM stats_meta ORDER BY partition_name");
+            $partitions = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        }
+
+        foreach ($partitions as $partition) {
+            // Проверяем существование таблицы (могла быть удалена)
+            $exists = $this->pdo->query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partition}'"
+            )->fetchColumn();
+            if ((int) $exists === 0) {
+                continue;
+            }
+
+            $sql = "SELECT * FROM {$partition} WHERE physical_ad_id = :id";
+            $params = ['id' => $physicalAdId];
+
+            if ($dateFrom !== null) {
+                $sql .= " AND date >= :dateFrom";
+                $params['dateFrom'] = $dateFrom;
+            }
+            if ($dateTo !== null) {
+                $sql .= " AND date <= :dateTo";
+                $params['dateTo'] = $dateTo;
+            }
+
+            $sql .= " ORDER BY date";
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute($params);
+            $allStats = array_merge($allStats, $stmt->fetchAll(PDO::FETCH_ASSOC));
+        }
+
+        // Обратная совместимость: читаем из старой таблицы stats
+        $oldStats = $this->getOldStats($physicalAdId, $dateFrom, $dateTo);
+        if ($oldStats !== []) {
+            $allStats = array_merge($allStats, $oldStats);
+        }
+
+        // Убираем дубликаты (по date), оставляем последние
+        $unique = [];
+        foreach ($allStats as $stat) {
+            $key = $stat['date'] ?? '';
+            if ($key !== '') {
+                $unique[$key] = $stat;
+            }
+        }
+        ksort($unique);
+
+        return array_values($unique);
+    }
+
+    /**
+     * Получить статистику из старой таблицы stats (обратная совместимость).
+     */
+    private function getOldStats(int $physicalAdId, ?string $dateFrom, ?string $dateTo): array
+    {
+        $sql = "SELECT * FROM stats WHERE physical_ad_id = :id";
+        $params = ['id' => $physicalAdId];
+
+        if ($dateFrom !== null) {
+            $sql .= " AND date >= :dateFrom";
+            $params['dateFrom'] = $dateFrom;
+        }
+        if ($dateTo !== null) {
+            $sql .= " AND date <= :dateTo";
+            $params['dateTo'] = $dateTo;
+        }
+
+        $sql .= " ORDER BY date";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    /**
+     * Определить имя секции по дате.
+     */
+    public function getPartitionName(string $date): string
+    {
+        $dt = \DateTimeImmutable::createFromFormat('Y-m-d', $date);
+        if ($dt === false) {
+            // Fallback: берём из первой части строки
+            $parts = explode('-', substr($date, 0, 10));
+            $year = $parts[0] ?? date('Y');
+            $month = $parts[1] ?? date('m');
+            return sprintf('statistics_%s_%s', $year, $month);
+        }
+        return sprintf('statistics_%s_%s', $dt->format('Y'), $dt->format('m'));
+    }
+
+    /**
+     * Убедиться, что секция существует, создать если нет.
+     */
+    public function ensurePartitionExists(string $partitionName): void
+    {
+        // Проверяем, существует ли таблица
+        $exists = $this->pdo->query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partitionName}'"
+        )->fetchColumn();
+
+        if ((int) $exists === 0) {
+            $this->pdo->exec("
+                CREATE TABLE {$partitionName} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    physical_ad_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    views INTEGER DEFAULT 0,
+                    uniq_views INTEGER DEFAULT 0,
+                    contacts INTEGER DEFAULT 0,
+                    uniq_contacts INTEGER DEFAULT 0,
+                    favorites INTEGER DEFAULT 0,
+                    uniq_favorites INTEGER DEFAULT 0,
+                    phone_shows INTEGER DEFAULT 0,
+                    chats INTEGER DEFAULT 0,
+                    price INTEGER DEFAULT 0,
+                    UNIQUE(physical_ad_id, date)
+                )
+            ");
+            $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_{$partitionName}_partition ON {$partitionName}(physical_ad_id, date)");
+
+            // Запись в stats_meta
+            $this->pdo->prepare(
+                "INSERT OR IGNORE INTO stats_meta (partition_name) VALUES (:name)"
+            )->execute([':name' => $partitionName]);
+        }
+    }
+
+    /**
+     * Получить список имён секций для периода.
+     */
+    public function getPartitionNamesForPeriod(string $dateFrom, string $dateTo): array
+    {
+        $chunks = $this->splitPeriodIntoMonths($dateFrom, $dateTo);
+        $partitions = [];
+        foreach ($chunks as [$chunkFrom, $chunkTo]) {
+            $fromDt = \DateTimeImmutable::createFromFormat('Y-m-d', $chunkFrom);
+            $toDt = \DateTimeImmutable::createFromFormat('Y-m-d', $chunkTo);
+            if ($fromDt === false || $toDt === false) {
+                continue;
+            }
+            $current = clone $fromDt;
+            while ($current <= $toDt) {
+                $name = $current->format('statistics_Y_m');
+                if (!in_array($name, $partitions, true)) {
+                    $partitions[] = $name;
+                }
+                $current = $current->modify('first day of next month');
+            }
+        }
+        return $partitions;
+    }
+
+    /**
+     * Разбить период на чанки по месяцам.
+     *
+     * @return list<array{0:string, 1:string}>
+     */
+    private function splitPeriodIntoMonths(string $dateFrom, string $dateTo): array
+    {
+        $chunks = [];
+        $current = new \DateTimeImmutable($dateFrom);
+        $end = new \DateTimeImmutable($dateTo);
+
+        while ($current <= $end) {
+            $lastDay = (clone $current)->modify('last day of this month');
+            $chunkEnd = $lastDay < $end ? $lastDay : $end;
+            $chunks[] = [$current->format('Y-m-d'), $chunkEnd->format('Y-m-d')];
+            $current = $chunkEnd->modify('+1 day');
+        }
+
+        return $chunks;
+    }
+
+    /**
+     * Миграция данных из старой таблицы stats в секции.
+     *
+     * @return array{migrated: int, partitions: int, errors: int}
+     */
+    public function migrateOldStats(): array
+    {
+        // Проверяем, существует ли старая таблица
+        $exists = $this->pdo->query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='stats'"
+        )->fetchColumn();
+
+        if ((int) $exists === 0) {
+            return ['migrated' => 0, 'partitions' => 0, 'errors' => 0];
+        }
+
+        $stmt = $this->pdo->query("
+            SELECT physical_ad_id, date, views, uniq_views, contacts, uniq_contacts, favorites, uniq_favorites
+            FROM stats ORDER BY date
         ");
-        $stmt->execute([':id' => $physicalAdId]);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $migrated = 0;
+        $partitions = [];
+        $errors = 0;
+
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($rows as $row) {
+                $partitionName = $this->getPartitionName($row['date']);
+                if (!isset($partitions[$partitionName])) {
+                    $partitions[$partitionName] = 0;
+                }
+
+                $this->ensurePartitionExists($partitionName);
+
+                $sql = "INSERT OR IGNORE INTO {$partitionName}
+                    (physical_ad_id, date, views, uniq_views, contacts, uniq_contacts, favorites, uniq_favorites)
+                    VALUES (:pad_id, :date, :views, :uniq_views, :contacts, :uniq_contacts, :favorites, :uniq_favorites)";
+
+                try {
+                    $this->pdo->prepare($sql)->execute([
+                        ':pad_id' => (int) $row['physical_ad_id'],
+                        ':date' => $row['date'],
+                        ':views' => (int) ($row['views'] ?? 0),
+                        ':uniq_views' => (int) ($row['uniq_views'] ?? 0),
+                        ':contacts' => (int) ($row['contacts'] ?? 0),
+                        ':uniq_contacts' => (int) ($row['uniq_contacts'] ?? 0),
+                        ':favorites' => (int) ($row['favorites'] ?? 0),
+                        ':uniq_favorites' => (int) ($row['uniq_favorites'] ?? 0),
+                    ]);
+                    $migrated++;
+                    $partitions[$partitionName]++;
+                } catch (\Throwable $e) {
+                    $errors++;
+                }
+            }
+
+            // Обновляем record_count в stats_meta
+            foreach ($partitions as $partitionName => $count) {
+                $this->pdo->prepare(
+                    "UPDATE stats_meta SET record_count = :cnt WHERE partition_name = :name"
+                )->execute([':cnt' => $count, ':name' => $partitionName]);
+            }
+
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
+        }
+
+        return [
+            'migrated' => $migrated,
+            'partitions' => count($partitions),
+            'errors' => $errors,
+        ];
+    }
+
+    /**
+     * Получить статистику для объявления из конкретной секции.
+     */
+    public function getStatsForAdInPartition(int $adId, int $year, int $month): array
+    {
+        $partitionName = sprintf('statistics_%04d_%02d', $year, $month);
+
+        $exists = $this->pdo->query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partitionName}'"
+        )->fetchColumn();
+
+        if ((int) $exists === 0) {
+            return [];
+        }
+
+        $stmt = $this->pdo->prepare("
+            SELECT * FROM {$partitionName}
+            WHERE physical_ad_id = :id
+            ORDER BY date
+        ");
+        $stmt->execute([':id' => $adId]);
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 

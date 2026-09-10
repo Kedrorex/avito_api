@@ -18,6 +18,7 @@ final class AvitoAPIClient
     private string $apiBaseUrl;
     private string $userId;
     private int $listRequestDelaySeconds;
+    private int $statsRequestDelaySeconds;
 
     /** @param array{client_id:string,client_secret:string,user_id:string,api_base_url?:string} $config */
     public function __construct(array $config)
@@ -39,6 +40,8 @@ final class AvitoAPIClient
             'clientId' => $clientId,
             'clientSecret' => $clientSecret,
         ]);
+
+        $this->statsRequestDelaySeconds = max(65, (int) ceil((float) ($config['stats_request_delay_seconds'] ?? 65)));
     }
 
     /** Obtain a client-credentials token through avito/oauth2-avito. */
@@ -73,20 +76,73 @@ final class AvitoAPIClient
             return [];
         }
 
-        $payload = $this->requestJson('POST', sprintf('/stats/v1/accounts/%s/items', rawurlencode($this->userId)), [
+        $payload = [
             'itemIds' => array_values($itemIds),
             'dateFrom' => $dateFrom,
             'dateTo' => $dateTo,
             'grouping' => $grouping,
-        ]);
+        ];
 
-        return $payload['result']['items'] ?? $payload['items'] ?? [];
+        $response = $this->requestJson('POST', sprintf('/stats/v1/accounts/%s/items', rawurlencode($this->userId)), $payload);
+
+        return $response['result']['items'] ?? $response['items'] ?? [];
     }
 
     /** @param list<int> $itemIds @return list<array<string, mixed>> */
     public function getStats(array $itemIds, string $dateFrom, string $dateTo): array
     {
         return $this->getStatsV2($itemIds, $dateFrom, $dateTo);
+    }
+
+    /**
+     * Запрос статистики с паузой и разбивкой по месяцам.
+     *
+     * @param list<int> $itemIds
+     * @return list<array<string, mixed>>
+     */
+    public function getStatsWithDelay(array $itemIds, string $dateFrom, string $dateTo, string $grouping = 'item'): array
+    {
+        // Пауза перед первым запросом
+        if ($this->statsRequestDelaySeconds > 0) {
+            sleep($this->statsRequestDelaySeconds);
+        }
+
+        // Разбиваем период на чанки по месяцам
+        $chunks = $this->splitPeriodIntoMonths($dateFrom, $dateTo);
+        $allStats = [];
+
+        foreach ($chunks as $chunkIndex => [$chunkFrom, $chunkTo]) {
+            $chunkStats = $this->getStatsV2($itemIds, $chunkFrom, $chunkTo, $grouping);
+            $allStats = array_merge($allStats, $chunkStats);
+
+            // Пауза между чанками
+            if ($chunkIndex < count($chunks) - 1 && $this->statsRequestDelaySeconds > 0) {
+                sleep($this->statsRequestDelaySeconds);
+            }
+        }
+
+        return $allStats;
+    }
+
+    /**
+     * Разбить период на чанки по месяцам (макс. 270 дней на чанк).
+     *
+     * @return list<array{0:string, 1:string}>
+     */
+    public static function splitPeriodIntoMonths(string $dateFrom, string $dateTo): array
+    {
+        $chunks = [];
+        $current = new \DateTimeImmutable($dateFrom);
+        $end = new \DateTimeImmutable($dateTo);
+
+        while ($current <= $end) {
+            $lastDay = (clone $current)->modify('last day of this month 23:59:59');
+            $chunkEnd = $lastDay < $end ? $lastDay : $end;
+            $chunks[] = [$current->format('Y-m-d'), $chunkEnd->format('Y-m-d')];
+            $current = $chunkEnd->modify('+1 day');
+        }
+
+        return $chunks;
     }
 
     /**

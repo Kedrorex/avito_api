@@ -256,10 +256,16 @@ class AvitoController
             'views' => 0, 'uniq_views' => 0,
             'contacts' => 0, 'uniq_contacts' => 0,
             'favorites' => 0, 'uniq_favorites' => 0,
+            'phone_shows' => 0, 'chats' => 0, 'price' => 0,
         ];
+        $lastPrice = 0;
         foreach ($stats as $stat) {
             foreach ($totals as $field => $_) {
                 $totals[$field] += (int) ($stat[$field] ?? 0);
+            }
+            // Последняя известная цена
+            if (($stat['price'] ?? 0) > 0) {
+                $lastPrice = (int) $stat['price'];
             }
         }
 
@@ -272,6 +278,10 @@ class AvitoController
         echo "  Published:    " . ($ad['published_at'] ?: '—') . "\n";
         echo "  Statistics:   " . count($stats) . " day(s)\n";
 
+        if ($lastPrice > 0) {
+            echo "  Current price: {$lastPrice}\n";
+        }
+
         if ($stats === []) {
             return;
         }
@@ -279,14 +289,17 @@ class AvitoController
         echo "  Period:       {$stats[0]['date']} — " . $stats[array_key_last($stats)]['date'] . "\n";
         echo "  Totals: views={$totals['views']} (unique={$totals['uniq_views']}), "
             . "contacts={$totals['contacts']} (unique={$totals['uniq_contacts']}), "
-            . "favorites={$totals['favorites']} (unique={$totals['uniq_favorites']})\n\n";
-        echo str_pad('Date', 12) . str_pad('Views', 9) . str_pad('Contacts', 11) . str_pad('Favorites', 10) . "\n";
-        echo str_repeat('-', 42) . "\n";
+            . "favorites={$totals['favorites']} (unique={$totals['uniq_favorites']}), "
+            . "phone_shows={$totals['phone_shows']}, chats={$totals['chats']}\n\n";
+        echo str_pad('Date', 12) . str_pad('Views', 9) . str_pad('Contacts', 11) . str_pad('Favorites', 10) . str_pad('Phone', 7) . str_pad('Chats', 7) . "\n";
+        echo str_repeat('-', 63) . "\n";
         foreach ($stats as $stat) {
             echo str_pad((string) $stat['date'], 12)
                 . str_pad((string) $stat['views'], 9)
                 . str_pad((string) $stat['contacts'], 11)
-                . str_pad((string) $stat['favorites'], 10) . "\n";
+                . str_pad((string) $stat['favorites'], 10)
+                . str_pad((string) ($stat['phone_shows'] ?? 0), 7)
+                . str_pad((string) ($stat['chats'] ?? 0), 7) . "\n";
         }
     }
 }

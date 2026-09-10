@@ -56,10 +56,11 @@ class RepublisherService
                 continue;
             }
 
-            $statsList = $this->apiClient->getStats(
+            $statsList = $this->apiClient->getStatsWithDelay(
                 array_values($itemIds),
                 $dateFrom,
-                $dateTo
+                $dateTo,
+                'item'
             );
 
             // Группируем статистику по itemId
@@ -116,8 +117,9 @@ class RepublisherService
         $created = $this->repository->syncFromApi($items);
         $dateTo = date('Y-m-d', strtotime('-1 day'));
         $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
-        $delaySeconds = (int) ($this->config['stats_request_delay_seconds'] ?? 10);
-        $batches = array_chunk($items, 200);
+        $delaySeconds = (int) ($this->config['stats_request_delay_seconds'] ?? 65);
+        // Пакеты по 1000 (максимум API для stats)
+        $batches = array_chunk($items, 1000);
         $savedItems = 0;
         $failedBatches = 0;
 
@@ -163,8 +165,8 @@ class RepublisherService
                 fwrite(STDERR, "  [ERROR] Batch {$displayBatch}: {$e->getMessage()}\n");
             }
 
-            // test_item.php подтвердил, что интервал 10 секунд между запросами
-            // статистики стабилен. Здесь один запрос обслуживает до 200 объявлений.
+            // Пауза 65 сек между запросами статистики (API limit: 1 req/min)
+            // Один запрос обслуживает до 200 объявлений.
             if ($batchNumber < count($batches) - 1 && $delaySeconds > 0) {
                 echo "  Waiting {$delaySeconds}s before next statistics request...\n";
                 sleep($delaySeconds);
@@ -186,12 +188,16 @@ class RepublisherService
     private function requestStatsWithRetry(array $itemIds, string $dateFrom, string $dateTo, int $batchNumber): array
     {
         $maxRetries = max(0, (int) ($this->config['max_retries'] ?? 3));
-        $retryDelay = max(1, (int) ($this->config['retry_delay_base'] ?? 60));
+        $retryDelay = max(65, (int) ($this->config['retry_delay_base'] ?? 65));
 
         for ($attempt = 0; ; $attempt++) {
             try {
-                // Тот же вызов, что в test_item.php, но с допустимым API списком до 200 ID.
-                return $this->apiClient->getStatsV2($itemIds, $dateFrom, $dateTo, 'item');
+                return $this->apiClient->getStatsWithDelay(
+                    $itemIds,
+                    $dateFrom,
+                    $dateTo,
+                    'item'
+                );
             } catch (\Throwable $e) {
                 if ($attempt >= $maxRetries) {
                     throw $e;
