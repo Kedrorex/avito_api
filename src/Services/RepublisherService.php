@@ -342,4 +342,58 @@ class RepublisherService
     {
         return $this->repository->getDailyRepubCount(date('Y-m-d'));
     }
+
+    /**
+     * Собрать объявления-кандидаты с 0 просмотрами
+     *
+     * @return array{found: int, added: int, skipped: int}
+     */
+    public function collectCandidates(int $days = 4): array
+    {
+        $candidateDays = (int) ($this->config['candidate_days'] ?? $days);
+        $candidates = $this->repository->findZeroViewCandidates($candidateDays);
+
+        $found = count($candidates);
+        $added = 0;
+        $skipped = 0;
+
+        foreach ($candidates as $candidate) {
+            $physicalAdId = (int) $candidate['id'];
+            $avitoId = (string) ($candidate['avito_id'] ?? '');
+            $logicalKey = (string) ($candidate['logical_key'] ?? '');
+
+            if ($avitoId === '') {
+                continue;
+            }
+
+            $inserted = $this->repository->addCandidate($physicalAdId, $avitoId, $logicalKey);
+
+            if ($inserted) {
+                // Обновляем статус на low_perf
+                $this->repository->updatePhysical($physicalAdId, ['status' => 'low_perf']);
+                $added++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        echo "  Found: {$found}\n";
+        echo "  Added to candidates: {$added}\n";
+        echo "  Skipped (already): {$skipped}\n";
+
+        return [
+            'found' => $found,
+            'added' => $added,
+            'skipped' => $skipped,
+        ];
+    }
+
+    /**
+     * Удалить кандидата (вызывается при републикации)
+     */
+    public function removeCandidate(int $physicalAdId): void
+    {
+        $this->repository->removeCandidate($physicalAdId);
+        $this->repository->updatePhysical($physicalAdId, ['status' => 'active']);
+    }
 }

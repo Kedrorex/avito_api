@@ -45,6 +45,10 @@ return [
         'min_age_days'      => 3,
         'stats_days'        => 3,
         'contact_threshold' => 0,
+
+        // Candidates settings (zero-view detection)
+        'candidate_days'      => 4,    // дней для анализа
+        'candidate_threshold' => 0,    // порог просмотров (0)
     ],
 
     // SQLite database

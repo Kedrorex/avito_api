@@ -87,6 +87,30 @@ class ItemRepository
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_physical_ads_avito_id ON physical_ads(avito_id)');
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_stats_physical_ad_date ON stats(physical_ad_id, date)');
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_stats_meta_partition ON stats_meta(partition_name)');
+
+        // Инициализация таблиц кандидатов
+        $this->initCandidatesTables();
+    }
+
+    /**
+     * Создать таблицы кандидатов, если не существуют.
+     */
+    private function initCandidatesTables(): void
+    {
+        // candidates_meta — аналог stats_meta для кандидатов
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS candidates_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                partition_name TEXT NOT NULL UNIQUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                record_count INTEGER DEFAULT 0
+            )
+        ");
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_candidates_meta_partition ON candidates_meta(partition_name)');
+
+        // Создаём секцию для текущего месяца
+        $currentPartition = $this->getCandidatePartitionName(date('Y-m-d'));
+        $this->ensureCandidatePartitionExists($currentPartition);
     }
 
     /**
@@ -660,5 +684,212 @@ class ItemRepository
         $this->updatePhysical($physicalAdId, [
             'old_avito_id' => $oldAvitoId,
         ]);
+    }
+
+    // ==================== Candidates (republish module) ====================
+
+    /**
+     * Получить имя секции кандидатов по дате.
+     */
+    public function getCandidatePartitionName(string $date): string
+    {
+        $dt = \DateTimeImmutable::createFromFormat('Y-m-d', $date);
+        if ($dt === false) {
+            $parts = explode('-', substr($date, 0, 10));
+            $year = $parts[0] ?? date('Y');
+            $month = $parts[1] ?? date('m');
+            return sprintf('republish_candidates_%s_%s', $year, $month);
+        }
+        return sprintf('republish_candidates_%s_%s', $dt->format('Y'), $dt->format('m'));
+    }
+
+    /**
+     * Убедиться, что секция кандидатов существует, создать если нет.
+     */
+    public function ensureCandidatePartitionExists(string $partitionName): void
+    {
+        $exists = $this->pdo->query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partitionName}'"
+        )->fetchColumn();
+
+        if ((int) $exists === 0) {
+            $this->pdo->exec("
+                CREATE TABLE {$partitionName} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    physical_ad_id INTEGER NOT NULL,
+                    avito_id TEXT NOT NULL,
+                    logical_key TEXT NOT NULL,
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(physical_ad_id)
+                )
+            ");
+            $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_{$partitionName}_physical_ad ON {$partitionName}(physical_ad_id)");
+            $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_{$partitionName}_avito ON {$partitionName}(avito_id)");
+
+            // Запись в candidates_meta
+            $this->pdo->prepare(
+                "INSERT OR IGNORE INTO candidates_meta (partition_name) VALUES (:name)"
+            )->execute([':name' => $partitionName]);
+        }
+    }
+
+    /**
+     * Найти объявления-кандидаты с суммарно 0 просмотров за N дней.
+     *
+     * @return list<array{
+     *     id: int,
+     *     logical_key: string,
+     *     avito_id: string,
+     *     published_at: string,
+     *     master_data: string
+     * }>
+     */
+    public function findZeroViewCandidates(int $days = 4): array
+    {
+        $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
+        $dateTo = date('Y-m-d', strtotime('-1 day'));
+
+        // Получаем список секций статистики за период
+        $partitions = $this->getPartitionNamesForPeriod($dateFrom, $dateTo);
+
+        if (empty($partitions)) {
+            return [];
+        }
+
+        // Строим UNION ALL запрос для суммирования views из всех секций
+        $unionParts = [];
+        foreach ($partitions as $partition) {
+            $unionParts[] = "SELECT views FROM {$partition} WHERE physical_ad_id = pa.id AND date >= :dateFrom AND date <= :dateTo";
+        }
+        $unionSql = implode(' UNION ALL ', $unionParts);
+
+        $sql = "
+            SELECT pa.id, pa.logical_key, pa.avito_id, pa.published_at, pa.master_data
+            FROM physical_ads pa
+            WHERE pa.status = 'active'
+              AND pa.published_at IS NOT NULL
+              AND julianday('now') - julianday(pa.published_at) <= :days
+              AND (
+                  SELECT COALESCE(SUM(s.views), 0)
+                  FROM ({$unionSql}) s
+              ) = 0
+        ";
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([
+            ':days' => $days,
+            ':dateFrom' => $dateFrom,
+            ':dateTo' => $dateTo,
+        ]);
+
+        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Фильтруем: приводим id к int
+        return array_map(function ($row) {
+            return [
+                'id' => (int) ($row['id'] ?? 0),
+                'logical_key' => (string) ($row['logical_key'] ?? ''),
+                'avito_id' => (string) ($row['avito_id'] ?? ''),
+                'published_at' => (string) ($row['published_at'] ?? ''),
+                'master_data' => (string) ($row['master_data'] ?? ''),
+            ];
+        }, $results);
+    }
+
+    /**
+     * Добавить кандидата в таблицу (секция по текущему месяцу).
+     */
+    public function addCandidate(int $physicalAdId, string $avitoId, string $logicalKey): bool
+    {
+        $partitionName = $this->getCandidatePartitionName(date('Y-m-d'));
+        $this->ensureCandidatePartitionExists($partitionName);
+
+        $sql = "INSERT OR IGNORE INTO {$partitionName}
+            (physical_ad_id, avito_id, logical_key)
+            VALUES (:pad_id, :avito_id, :logical_key)";
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([
+            ':pad_id' => $physicalAdId,
+            ':avito_id' => $avitoId,
+            ':logical_key' => $logicalKey,
+        ]);
+
+        return $stmt->rowCount() > 0;
+    }
+
+    /**
+     * Удалить кандидата из всех секций.
+     */
+    public function removeCandidate(int $physicalAdId): void
+    {
+        // Получаем все секции кандидатов
+        $stmt = $this->pdo->query("SELECT partition_name FROM candidates_meta ORDER BY partition_name");
+        $partitions = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+        foreach ($partitions as $partition) {
+            $exists = $this->pdo->query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partition}'"
+            )->fetchColumn();
+
+            if ((int) $exists > 0) {
+                $this->pdo->prepare("DELETE FROM {$partition} WHERE physical_ad_id = :id")
+                    ->execute([':id' => $physicalAdId]);
+            }
+        }
+    }
+
+    /**
+     * Получить всех кандидатов из всех секций.
+     *
+     * @return list<array{
+     *     id: int,
+     *     physical_ad_id: int,
+     *     avito_id: string,
+     *     logical_key: string,
+     *     added_at: string
+     * }>
+     */
+    public function getCandidates(): array
+    {
+        $stmt = $this->pdo->query("SELECT partition_name FROM candidates_meta ORDER BY partition_name");
+        $partitions = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+        $allCandidates = [];
+        foreach ($partitions as $partition) {
+            $exists = $this->pdo->query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partition}'"
+            )->fetchColumn();
+
+            if ((int) $exists === 0) {
+                continue;
+            }
+
+            $stmt = $this->pdo->prepare("SELECT * FROM {$partition} ORDER BY added_at DESC");
+            $stmt->execute();
+            $allCandidates = array_merge($allCandidates, $stmt->fetchAll(PDO::FETCH_ASSOC));
+        }
+
+        return $allCandidates;
+    }
+
+    /**
+     * Подсчёт кандидатов за месяц.
+     */
+    public function getCandidateCountForMonth(int $year, int $month): int
+    {
+        $partitionName = sprintf('republish_candidates_%04d_%02d', $year, $month);
+
+        $exists = $this->pdo->query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partitionName}'"
+        )->fetchColumn();
+
+        if ((int) $exists === 0) {
+            return 0;
+        }
+
+        $stmt = $this->pdo->prepare("SELECT COUNT(*) FROM {$partitionName}");
+        $stmt->execute();
+        return (int) $stmt->fetchColumn();
     }
 }

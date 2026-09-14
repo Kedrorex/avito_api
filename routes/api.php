@@ -29,4 +29,9 @@ return function (App $app) {
 
     // Детали объявления
     $app->get('/item/{id}', \App\Controllers\AvitoController::class . ':getItemDetail');
+
+    // Кандидаты для републикации
+    $app->post('/collect-candidates', \App\Controllers\AvitoController::class . ':collectCandidates');
+    $app->get('/candidates', \App\Controllers\AvitoController::class . ':getCandidates');
+    $app->delete('/candidates/{id}', \App\Controllers\AvitoController::class . ':removeCandidate');
 };

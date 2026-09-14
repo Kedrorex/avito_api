@@ -302,4 +302,106 @@ class AvitoController
                 . str_pad((string) ($stat['chats'] ?? 0), 7) . "\n";
         }
     }
+
+    /**
+     * Собрать кандидатов для републикации (CLI + HTTP)
+     */
+    public function collectCandidates(int $days = 4): void
+    {
+        echo "Collecting zero-view candidates...\n";
+        $result = $this->republisher->collectCandidates($days);
+
+        echo "\nCompleted\n";
+        echo "  Found:            {$result['found']}\n";
+        echo "  Added to candidates: {$result['added']}\n";
+        echo "  Skipped (already): {$result['skipped']}\n";
+    }
+
+    /**
+     * Вывести список всех кандидатов (CLI)
+     */
+    public function showCandidates(): void
+    {
+        $candidates = $this->repository->getCandidates();
+
+        echo "Republish candidates (total: " . count($candidates) . ")\n";
+        echo str_repeat('-', 80) . "\n";
+
+        if (empty($candidates)) {
+            echo "  No candidates found.\n";
+            return;
+        }
+
+        foreach ($candidates as $candidate) {
+            $ad = $this->repository->getById((int) $candidate['physical_ad_id']);
+            $title = '';
+            $publishedAt = '';
+            if ($ad !== null && !empty($ad['master_data'])) {
+                $masterData = json_decode($ad['master_data'], true);
+                $title = $masterData['title'] ?? '';
+                $publishedAt = $ad['published_at'] ?? '';
+            }
+
+            echo "  ID: {$candidate['physical_ad_id']} | Avito: {$candidate['avito_id']} | "
+                . "Key: {$candidate['logical_key']} | Added: {$candidate['added_at']}\n";
+            if ($title !== '') {
+                echo "    Title: {$title} | Published: {$publishedAt}\n";
+            }
+        }
+    }
+
+    /**
+     * Получить список кандидатов (HTTP JSON)
+     */
+    public function getCandidates(): string
+    {
+        $candidates = $this->repository->getCandidates();
+        $data = [];
+
+        foreach ($candidates as $candidate) {
+            $ad = $this->repository->getById((int) $candidate['physical_ad_id']);
+            $title = '';
+            $publishedAt = '';
+
+            if ($ad !== null && !empty($ad['master_data'])) {
+                $masterData = json_decode($ad['master_data'], true);
+                $title = $masterData['title'] ?? '';
+                $publishedAt = $ad['published_at'] ?? '';
+            }
+
+            $data[] = [
+                'physical_ad_id' => (int) $candidate['physical_ad_id'],
+                'avito_id' => (string) $candidate['avito_id'],
+                'logical_key' => (string) $candidate['logical_key'],
+                'added_at' => (string) $candidate['added_at'],
+                'title' => $title,
+                'published_at' => $publishedAt,
+            ];
+        }
+
+        return json_encode([
+            'status' => 'success',
+            'count' => count($data),
+            'data' => $data,
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Удалить кандидата (HTTP)
+     */
+    public function removeCandidate(int $physicalAdId): string
+    {
+        try {
+            $this->republisher->removeCandidate($physicalAdId);
+            return json_encode([
+                'status' => 'success',
+                'message' => "Candidate {$physicalAdId} removed",
+            ], JSON_UNESCAPED_UNICODE);
+        } catch (\Throwable $e) {
+            return json_encode([
+                'status' => 'error',
+                'message' => $e->getMessage(),
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    }
 }

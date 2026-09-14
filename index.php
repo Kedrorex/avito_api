@@ -113,9 +113,16 @@ if ($cli) {
             }
             echo $controller->getItemDetail((int) $itemId) . "\n";
             break;
+        case 'collect-candidates':
+            $days = isset($argv[2]) ? (int) $argv[2] : 4;
+            $controller->collectCandidates($days);
+            break;
+        case 'show-candidates':
+            $controller->showCandidates();
+            break;
         default:
             echo "Unknown command: {$command}\n";
-            echo "Available: run, sync, active, status-counts, republish, stats, item, collect-stats, ad\n";
+            echo "Available: run, sync, active, status-counts, republish, stats, item, collect-stats, ad, collect-candidates, show-candidates\n";
             exit(1);
     }
 } else {
