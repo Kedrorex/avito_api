@@ -3,7 +3,9 @@
 namespace App\Controllers;
 
 use App\Repositories\ItemRepository;
+use App\Services\AnalysisService;
 use App\Services\AvitoAPIClient;
+use App\Services\FeedGeneratorService;
 use App\Services\RepublisherService;
 
 /**
@@ -396,6 +398,137 @@ class AvitoController
             return json_encode([
                 'status' => 'success',
                 'message' => "Candidate {$physicalAdId} removed",
+            ], JSON_UNESCAPED_UNICODE);
+        } catch (\Throwable $e) {
+            return json_encode([
+                'status' => 'error',
+                'message' => $e->getMessage(),
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    }
+
+    /**
+     * Запустить анализ всех объявлений (CLI)
+     */
+    public function analyze(): void
+    {
+        echo "Running analysis on all active ads...\n";
+
+        $analysis = new AnalysisService($this->repository, $this->config);
+        $candidates = $analysis->findAllCandidates();
+
+        echo "\nAnalysis complete\n";
+        echo "  Total active ads: " . count($this->repository->getActive()) . "\n";
+        echo "  Candidates found: " . count($candidates) . "\n";
+
+        foreach ($candidates as $i => $item) {
+            $ad = $item['ad'];
+            $analysisResult = $item['analysis'];
+            $avitoId = $ad['avito_id'] ?? 'N/A';
+            $title = '';
+            if (!empty($ad['master_data'])) {
+                $masterData = json_decode($ad['master_data'], true);
+                $title = $masterData['title'] ?? '';
+            }
+
+            echo "  " . ($i + 1) . ". avito_id={$avitoId} "
+                . "views={$analysisResult['total_views']} "
+                . "contacts={$analysisResult['total_contacts']} "
+                . "rules=" . implode(',', $analysisResult['matched_rules']) . "\n";
+            if ($title !== '') {
+                echo "     Title: {$title}\n";
+            }
+        }
+    }
+
+    /**
+     * Показать отчёт по анализу (CLI + HTTP)
+     */
+    public function analyzeReport(): string
+    {
+        $analysis = new AnalysisService($this->repository, $this->config);
+        $candidates = $analysis->findAllCandidates();
+        $activeCount = count($this->repository->getActive());
+
+        // Группируем по правилам
+        $ruleCounts = [];
+        foreach ($candidates as $item) {
+            $rules = $item['analysis']['matched_rules'] ?? [];
+            foreach ($rules as $rule) {
+                if (!isset($ruleCounts[$rule])) {
+                    $ruleCounts[$rule] = 0;
+                }
+                $ruleCounts[$rule]++;
+            }
+        }
+
+        return json_encode([
+            'status' => 'success',
+            'total_active' => $activeCount,
+            'total_candidates' => count($candidates),
+            'rule_counts' => $ruleCounts,
+            'candidates' => array_map(function ($item) {
+                return [
+                    'avito_id' => $item['ad']['avito_id'] ?? '',
+                    'title' => $this->extractTitle($item['ad']),
+                    'total_views' => $item['analysis']['total_views'] ?? 0,
+                    'total_contacts' => $item['analysis']['total_contacts'] ?? 0,
+                    'matched_rules' => $item['analysis']['matched_rules'] ?? [],
+                ];
+            }, $candidates),
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Сгенерировать TSV фид для Avito AutoLoad (HTTP POST)
+     *
+     * @param bool $priorityMode Приоритетный режим (кандидаты первыми)
+     */
+    public function generateFeed(bool $priorityMode = true): string
+    {
+        try {
+            $feedGenerator = new FeedGeneratorService($this->repository, $this->config);
+            $result = $feedGenerator->generate($priorityMode);
+
+            return json_encode([
+                'status' => 'success',
+                'file' => $result['file'] ?? '',
+                'count' => $result['count'] ?? 0,
+                'headers' => $result['headers'] ?? [],
+                'priority_mode' => $priorityMode,
+            ], JSON_UNESCAPED_UNICODE);
+        } catch (\Throwable $e) {
+            return json_encode([
+                'status' => 'error',
+                'message' => $e->getMessage(),
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    }
+
+    /**
+     * Извлечь title из master_data JSON
+     */
+    private function extractTitle(array $ad): string
+    {
+        if (empty($ad['master_data'])) {
+            return '';
+        }
+        $masterData = json_decode($ad['master_data'], true);
+        return $masterData['title'] ?? '';
+    }
+
+    /**
+     * Получить информацию о последней генерации фида (HTTP GET)
+     */
+    public function getFeedInfo(): string
+    {
+        try {
+            $feedGenerator = new FeedGeneratorService($this->repository, $this->config);
+            $info = $feedGenerator->getLastGeneration();
+
+            return json_encode([
+                'status' => 'success',
+                'data' => empty($info) ? null : $info,
             ], JSON_UNESCAPED_UNICODE);
         } catch (\Throwable $e) {
             return json_encode([

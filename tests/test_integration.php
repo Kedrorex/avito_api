@@ -7,7 +7,7 @@
  * Запуск: php test_integration.php [-v|--verbose]
  */
 
-$rootDir = __DIR__;
+$rootDir = dirname(__DIR__);
 require $rootDir . '/vendor/autoload.php';
 require $rootDir . '/env_helper.php';
 

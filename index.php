@@ -120,9 +120,104 @@ if ($cli) {
         case 'show-candidates':
             $controller->showCandidates();
             break;
+        case 'feed':
+            // Парсим флаги --priority и --flat
+            $priorityMode = true; // по умолчанию — приоритетный
+            for ($i = 2; $i < count($argv); $i++) {
+                if ($argv[$i] === '--flat') {
+                    $priorityMode = false;
+                } elseif ($argv[$i] === '--priority') {
+                    $priorityMode = true;
+                }
+            }
+            $feedGenerator = new \App\Services\FeedGeneratorService($repository, $config);
+            $result = $feedGenerator->generate($priorityMode);
+            if ($result['count'] > 0) {
+                echo "\n  Заголовки (первые 5):\n";
+                foreach (array_slice($result['headers'], 0, 5) as $i => $h) {
+                    echo "    " . ($i + 1) . ". {$h}\n";
+                }
+                echo "    ... всего: " . count($result['headers']) . "\n";
+                echo "  Режим: " . ($priorityMode ? 'приоритетный' : 'обычный') . "\n";
+            }
+            break;
+        case 'feed-info':
+            $feedGenerator = new \App\Services\FeedGeneratorService($repository, $config);
+            $info = $feedGenerator->getLastGeneration();
+            if (empty($info)) {
+                echo "  Нет сгенерированных файлов\n";
+            } else {
+                echo "  Файл:   {$info['last_file']}\n";
+                echo "  Дата:   {$info['last_date']}\n";
+                echo "  Объявл: {$info['last_count']}\n";
+            }
+            break;
+        case 'analyze':
+            $analysis = new \App\Services\AnalysisService($repository, $config);
+            $candidates = $analysis->findAllCandidates();
+
+            echo "\nAnalysis complete\n";
+            echo "  Total active ads: " . count($repository->getActive()) . "\n";
+            echo "  Candidates found: " . count($candidates) . "\n";
+
+            foreach ($candidates as $i => $item) {
+                $ad = $item['ad'];
+                $analysisResult = $item['analysis'];
+                $avitoId = $ad['avito_id'] ?? 'N/A';
+                $title = '';
+                if (!empty($ad['master_data'])) {
+                    $masterData = json_decode($ad['master_data'], true);
+                    $title = $masterData['title'] ?? '';
+                }
+
+                echo "  " . ($i + 1) . ". avito_id={$avitoId} "
+                    . "views={$analysisResult['total_views']} "
+                    . "contacts={$analysisResult['total_contacts']} "
+                    . "rules=" . implode(',', $analysisResult['matched_rules']) . "\n";
+                if ($title !== '') {
+                    echo "     Title: {$title}\n";
+                }
+            }
+            break;
+        case 'analyze-report':
+            $analysis = new \App\Services\AnalysisService($repository, $config);
+            $candidates = $analysis->findAllCandidates();
+            $activeCount = count($repository->getActive());
+
+            // Группируем по правилам
+            $ruleCounts = [];
+            foreach ($candidates as $item) {
+                $rules = $item['analysis']['matched_rules'] ?? [];
+                foreach ($rules as $rule) {
+                    if (!isset($ruleCounts[$rule])) {
+                        $ruleCounts[$rule] = 0;
+                    }
+                    $ruleCounts[$rule]++;
+                }
+            }
+
+            echo "\nAnalysis Report\n";
+            echo str_repeat('-', 60) . "\n";
+            echo "  Total active ads:   {$activeCount}\n";
+            echo "  Total candidates:   " . count($candidates) . "\n";
+            echo "  Rule breakdown:\n";
+            foreach ($ruleCounts as $rule => $count) {
+                echo "    {$rule}: {$count}\n";
+            }
+
+            echo "\n  Candidates:\n";
+            foreach ($candidates as $i => $item) {
+                $ad = $item['ad'];
+                $analysisResult = $item['analysis'];
+                echo "    " . ($i + 1) . ". avito_id=" . ($ad['avito_id'] ?? 'N/A')
+                    . " views={$analysisResult['total_views']}"
+                    . " contacts={$analysisResult['total_contacts']}"
+                    . " rules=" . implode(',', $analysisResult['matched_rules']) . "\n";
+            }
+            break;
         default:
             echo "Unknown command: {$command}\n";
-            echo "Available: run, sync, active, status-counts, republish, stats, item, collect-stats, ad, collect-candidates, show-candidates\n";
+            echo "Available: run, sync, active, status-counts, republish, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, analyze, analyze-report\n";
             exit(1);
     }
 } else {

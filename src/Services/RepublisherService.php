@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\DTO\AnalysisRuleDTO;
 use App\Repositories\ItemRepository;
 
 /**
@@ -108,7 +109,7 @@ class RepublisherService
         echo "  Loading advertisement list...\n";
         $items = $this->apiClient->getAllItems(
             $statuses,
-            100,
+            200,
             static function (int $page, int $loaded, int $total): void {
                 $totalLabel = $total > 0 ? (string) $total : '?';
                 echo "  List page {$page}: {$loaded}/{$totalLabel} ads loaded\n";
@@ -117,9 +118,9 @@ class RepublisherService
         $created = $this->repository->syncFromApi($items);
         $dateTo = date('Y-m-d', strtotime('-1 day'));
         $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
-        $delaySeconds = (int) ($this->config['stats_request_delay_seconds'] ?? 65);
-        // Пакеты по 1000 (максимум API для stats)
-        $batches = array_chunk($items, 1000);
+        $delaySeconds = (int) ($this->config['stats_request_delay_seconds'] ?? 8);
+        // Пакеты по 200 — API возвращает 500 при больших пакетах
+        $batches = array_chunk($items, 200);
         $savedItems = 0;
         $failedBatches = 0;
 
@@ -217,67 +218,18 @@ class RepublisherService
     /**
      * Найти объявления-кандидаты для републикации
      *
-     * Критерии:
-     * - Возраст >= min_age_days
-     * - contacts <= threshold за последние N дней
-     * - Сортировка: меньше просмотров → выше приоритет
+     * Делегирует AnalysisService — настраиваемые пороги вместо хардкода.
+     * Обратная совместимость: возвращает только массивы объявлений.
      */
     public function findCandidates(
         int $days = 3,
         int $threshold = 0
     ): array {
-        $activeAds = $this->repository->getActive();
-        $minAgeDays = (int) ($this->config['min_age_days'] ?? 3);
-        $candidates = [];
+        $analysis = new AnalysisService($this->repository, $this->config);
+        $results = $analysis->findAllCandidates();
 
-        foreach ($activeAds as $ad) {
-            if (!$ad['published_at']) {
-                continue;
-            }
-
-            $publishedAt = new \DateTime($ad['published_at']);
-            $age = (new \DateTime())->diff($publishedAt)->days;
-
-            if ($age < $minAgeDays) {
-                continue;
-            }
-
-            // Получить статистику из БД
-            $stats = $this->repository->getStats((int) $ad['id']);
-            $hasStats = count($stats) > 0;
-
-            $contacts = 0;
-            $views = 0;
-
-            if ($hasStats) {
-                // Берём последние N дней
-                $recentStats = array_slice($stats, -$days);
-                foreach ($recentStats as $s) {
-                    $contacts += (int) ($s['contacts'] ?? 0);
-                    $views += (int) ($s['views'] ?? $s['uniq_views'] ?? 0);
-                }
-
-                if ($contacts > $threshold) {
-                    continue; // не кандидат — есть контакты
-                }
-            } else {
-                $views = 0;
-            }
-
-            $candidates[] = [
-                'ad' => $ad,
-                'age_days' => $age,
-                'contacts' => $contacts,
-                'views' => $views,
-                'has_stats' => $hasStats,
-            ];
-        }
-
-        // Сортируем: меньше просмотров → выше приоритет
-        usort($candidates, fn($a, $b) => $a['views'] <=> $b['views']);
-
-        // Возвращаем только массивы объявлений
-        return array_map(fn($c) => $c['ad'], $candidates);
+        // Возвращаем только массивы объявлений (обратная совместимость)
+        return array_map(fn($r) => $r['ad'], $results);
     }
 
     /**
@@ -301,10 +253,9 @@ class RepublisherService
 
         // 1. Деактивируем старое на Avito
         if ($avitoId !== '') {
-            $success = $this->apiClient->deactivateItem((int) $avitoId);
-            if (!$success) {
-                echo "  [ERROR] Не удалось деактивировать {$avitoId}\n";
-                $this->repository->updatePhysical((int) $ad['id'], ['status' => 'error']);
+            $result = $this->apiClient->deactivateItem((int) $avitoId);
+            if (!$result['success']) {
+                echo "  [ERROR] Не удалось деактивировать {$avitoId}: " . ($result['message'] ?? 'unknown') . "\n";
                 return null;
             }
         }

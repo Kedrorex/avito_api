@@ -37,8 +37,7 @@ return [
             'contactsMessenger',
         ],
         // Пауза между пакетными запросами статистики
-        // API: 1 запрос в минуту → 65 сек как запас
-        'stats_request_delay_seconds' => 65,
+        'stats_request_delay_seconds' => 8,
 
         // Republisher settings
         'max_daily_repub'   => 70,
@@ -49,6 +48,41 @@ return [
         // Candidates settings (zero-view detection)
         'candidate_days'      => 4,    // дней для анализа
         'candidate_threshold' => 0,    // порог просмотров (0)
+    ],
+
+    // Анализ и пороги для кандидатов на переопубликовку
+    'analysis_thresholds' => [
+        [
+            'name' => 'zero_contacts',
+            'days' => 5,
+            'max_views' => 0,
+            'max_contacts' => 0,
+            'max_favorites' => 0,
+        ],
+        [
+            'name' => 'low_views',
+            'days' => 10,
+            'max_views' => 1,
+            'max_contacts' => 0,
+            'max_favorites' => 0,
+        ],
+    ],
+
+    // Feed settings (Avito AutoLoad)
+    'feed' => [
+        // Каталог для выгрузки TSV файлов
+        'output_dir'       => __DIR__ . '/../fid',
+
+        // Категория фида (соответствует шаблону Avito)
+        'category'         => 'Транспорт - Запчасти и аксессуары - Запчасти - Для автомобилей - Двигатель',
+
+        // Значения по умолчанию для обязательных полей
+        'default_views'         => '',           // Способ размещения
+        'default_ad_type'       => '',           // Вид объявления
+        'default_product_type'  => '',           // Тип товара
+        'default_part_type'     => '',           // Вид запчасти
+        'default_engine_type'   => '',           // Тип детали двигателя
+        'default_condition'     => 'new',        // Состояние: new / used / restored
     ],
 
     // SQLite database

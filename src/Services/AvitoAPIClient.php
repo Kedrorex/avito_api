@@ -41,7 +41,7 @@ final class AvitoAPIClient
             'clientSecret' => $clientSecret,
         ]);
 
-        $this->statsRequestDelaySeconds = max(65, (int) ceil((float) ($config['stats_request_delay_seconds'] ?? 65)));
+        $this->statsRequestDelaySeconds = max(1, (int) ceil((float) ($config['stats_request_delay_seconds'] ?? 8)));
     }
 
     /** Obtain a client-credentials token through avito/oauth2-avito. */
@@ -258,6 +258,21 @@ final class AvitoAPIClient
             return null;
         } catch (\Throwable $e) {
             return null;
+        }
+    }
+
+    /**
+     * Деактивировать объявление на Avito.
+     *
+     * @return array{success: bool, message?: string}
+     */
+    public function deactivateItem(int $itemId): array
+    {
+        try {
+            $this->requestJson('POST', sprintf('/core/v1/items/%d/deactivate', $itemId));
+            return ['success' => true];
+        } catch (\Throwable $e) {
+            return ['success' => false, 'message' => $e->getMessage()];
         }
     }
 

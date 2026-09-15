@@ -120,12 +120,12 @@ $dateTo = date('Y-m-d', strtotime('-1 day'));
 $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
 echo "\n  Period: {$dateFrom} — {$dateTo}\n";
 
-$delaySeconds = (int) ($config['avito']['stats_request_delay_seconds'] ?? 65);
+$delaySeconds = (int) ($config['avito']['stats_request_delay_seconds'] ?? 8);
 $maxRetries = (int) ($config['avito']['max_retries'] ?? 3);
 $retryDelay = (int) ($config['avito']['retry_delay_base'] ?? 65);
 
-// Пакеты по 1000 (максимум API для stats)
-$batches = array_chunk($allItems, 1000);
+// Пакеты по 200 — API возвращает 500 при больших пакетах
+$batches = array_chunk($allItems, 200);
 $totalBatches = count($batches);
 $savedItems = 0;
 $failedBatches = 0;

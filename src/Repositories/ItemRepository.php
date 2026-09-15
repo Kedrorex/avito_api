@@ -426,6 +426,19 @@ class ItemRepository
     }
 
     /**
+     * Получить статистику за последние N дней.
+     *
+     * Читает из секций + старой таблицы stats для обратной совместимости.
+     */
+    public function getStatsForLastDays(int $physicalAdId, int $days): array
+    {
+        $dateTo = date('Y-m-d', strtotime('-1 day'));
+        $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
+
+        return $this->getStats($physicalAdId, $dateFrom, $dateTo);
+    }
+
+    /**
      * Получить статистику из старой таблицы stats (обратная совместимость).
      */
     private function getOldStats(int $physicalAdId, ?string $dateFrom, ?string $dateTo): array
@@ -516,7 +529,7 @@ class ItemRepository
             }
             $current = clone $fromDt;
             while ($current <= $toDt) {
-                $name = $current->format('statistics_Y_m');
+                $name = 'statistics_' . $current->format('Y_m');
                 if (!in_array($name, $partitions, true)) {
                     $partitions[] = $name;
                 }
