@@ -15,6 +15,9 @@ class StatsDTO
         public readonly int     $uniqContacts = 0,
         public readonly int     $favorites = 0,
         public readonly int     $uniqFavorites = 0,
+        public readonly int     $phoneShows = 0,
+        public readonly int     $chats = 0,
+        public readonly int     $price = 0,
     ) {
     }
 
@@ -31,6 +34,9 @@ class StatsDTO
             uniqContacts: (int) ($data['uniqContacts'] ?? 0),
             favorites: (int) ($data['favorites'] ?? 0),
             uniqFavorites: (int) ($data['uniqFavorites'] ?? 0),
+            phoneShows: (int) ($data['contactsShowPhone'] ?? 0),
+            chats: (int) ($data['contactsMessenger'] ?? 0),
+            price: (int) ($data['price'] ?? 0),
         );
     }
 }

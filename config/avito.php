@@ -26,22 +26,72 @@ return [
 
         // Retry settings
         'max_retries'       => 3,
-        'retry_delay_base'  => 60, // секунды для ConnectionResetError
+        'retry_delay_base'  => 65, // секунды для ConnectionResetError
 
         // Stats
         'stats_fields' => [
             'views', 'uniqViews',
             'contacts', 'uniqContacts',
             'favorites', 'uniqFavorites',
+            'contactsShowPhone',
+            'contactsMessenger',
         ],
-        // Пауза между пакетными запросами статистики (до 200 объявлений в пакете)
-        'stats_request_delay_seconds' => 10,
+        // Пауза между пакетными запросами статистики
+        'stats_request_delay_seconds' => 8,
+        // Таймаут HTTP-запросов к Avito API (секунды)
+        'request_timeout' => 120,
 
         // Republisher settings
         'max_daily_repub'   => 70,
         'min_age_days'      => 3,
         'stats_days'        => 3,
         'contact_threshold' => 0,
+
+        // Candidates settings (zero-view detection)
+        'candidate_days'      => 4,    // дней для анализа
+        'candidate_threshold' => 0,    // порог просмотров (0)
+    ],
+
+    // Анализ и пороги для кандидатов на переопубликовку
+    'analysis_thresholds' => [
+        [
+            'name' => 'zero_contacts',
+            'days' => 5,
+            'max_views' => 0,
+            'max_contacts' => 0,
+            'max_favorites' => 0,
+        ],
+        [
+            'name' => 'low_views',
+            'days' => 10,
+            'max_views' => 1,
+            'max_contacts' => 0,
+            'max_favorites' => 0,
+        ],
+    ],
+
+    // Feed settings (Avito AutoLoad)
+    'feed' => [
+        // Каталог для выгрузки TSV файлов
+        'output_dir'       => __DIR__ . '/../fid',
+
+        // Категория фида (соответствует шаблону Avito)
+        'category'         => 'Транспорт - Запчасти и аксессуары - Запчасти - Для автомобилей - Двигатель',
+
+        // Значения по умолчанию для обязательных полей
+        'default_views'         => 'Package',          // Способ размещения
+        'default_ad_type'       => '',                 // Вид объявления
+        'default_product_type'  => '',                 // Тип товара
+        'default_part_type'     => '',                 // Вид запчасти
+        'default_engine_type'   => '',                 // Тип детали двигателя
+        'default_condition'     => 'new',              // Состояние: new / used / restored
+
+        // Контактные данные компании
+        'company_name'          => '',                 // Название компании
+        'email'                 => '',                 // Почта
+
+        // Источник данных для AutoLoad (импорт из CSV)
+        'autoload_source'       => __DIR__ . '/../fid/Основная база.csv',
     ],
 
     // SQLite database
@@ -51,6 +101,8 @@ return [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
+            // SQLite: ждать до 10 сек при блокировке (1001 = PDO::SQLITE_ATTR_BUSY_TIMEOUT, PHP 8.1+)
+            1001 => 10000,
         ],
     ],
 ];
