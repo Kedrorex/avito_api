@@ -1,420 +1,382 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Services;
 
 use Avito\OAuth2\Client\Provider\Avito;
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\GuzzleException;
-use League\OAuth2\Client\Grant\ClientCredentials;
-use League\OAuth2\Client\Token\AccessToken;
+use League\OAuth2\Client\Token\AccessTokenInterface;
 use Psr\Http\Message\ResponseInterface;
 
 /**
- * Клиент Avito API
- *
- * Рефакторинг с использованием библиотеки avito/oauth2-avito:
- * - OAuth2 токен управляется через League OAuth2 Client + Avito Provider
- * - Rate limiting: 25 req/min
- * - Pagination: page + per_page
- * - Retry при ошибках
- *
- * === ЧТО ИЗМЕНИЛОСЬ ===
- * 1. refreshToken() → getToken() — использует $provider->getAccessToken(new ClientCredentials())
- * 2. Ручное формирование Bearer заголовка → $provider->getHeaders($token)
- * 3. Ручной Guzzle Client → $provider->getHttpClient()
- * 4. Удалена ручная логика OAuth2 — библиотека делает всё за нас
+ * HTTP client for Avito API authenticated by avito/oauth2-avito.
  */
-class AvitoAPIClient
+final class AvitoAPIClient
 {
-    /**
-     * @var Avito — OAuth2 провайдер от Avito (обёртка над League OAuth2 Client)
-     * 
-     * Этот объект знает:
-     * - Где находится token endpoint Avito (/token)
-     * - Как формировать Bearer заголовки
-     * - Как обновлять токены
-     */
     private Avito $provider;
+    private ?AccessTokenInterface $accessToken = null;
+    private string $apiBaseUrl;
+    private string $userId;
+    private int $listRequestDelaySeconds;
+    private int $statsRequestDelaySeconds;
+    private float $requestTimeout;
+    private array $config;
 
-    /**
-     * @var Client — HTTP клиент для запросов к Avito API
-     * 
-     * Получен из $provider->getHttpClient(), который уже настроен
-     * с нужными базовыми настройками.
-     */
-    private Client $httpClient;
-
-    /**
-     * @var AccessToken|null — текущий токен доступа
-     * 
-     * Хранится как объект League OAuth2 AccessToken, который знает:
-     * - getToken() — сам access token string
-     * - getRefreshToken() — refresh token (если есть)
-     * - getExpires() — timestamp истечения
-     * - hasExpired() — проверка, истёк ли токен
-     */
-    private ?AccessToken $accessToken = null;
-
-    /**
-     * @var string|null — user_id для контекста аккаунта
-     * 
-     * Устанавливается через $provider->setBaseDomain()
-     * Это привязывает запросы к конкретному аккаунту Avito.
-     */
-    private ?string $userId = null;
-
-    /**
-     * @var float — задержка между запросами для rate limiting
-     * 
-     * По умолчанию 8 секунд (~25 запросов в минуту)
-     */
-    private float $rateLimitDelay;
-
-    /**
-     * @var float — время последнего запроса (для rate limiting)
-     */
-    private float $lastRequestTime = 0;
-
-    /**
-     * Конструктор клиента
-     *
-     * @param array $config Конфигурация с ключами:
-     *   - client_id: OAuth2 Client ID из интеграции Avito
-     *   - client_secret: OAuth2 Client Secret из интеграции Avito
-     *   - user_id: ID аккаунта Avito (для контекста)
-     *   - rate_limit_delay: задержка между запросами в секундах
-     *
-     * === Логика инициализации ===
-     * 1. Создаём Avito провайдер с credentials
-     * 2. Устанавливаем baseDomain (user_id)
-     * 3. Получаем HTTP клиент из провайдера
-     * 4. Запрашиваем токен через ClientCredentials grant
-     */
+    /** @param array{client_id:string,client_secret:string,user_id:string,api_base_url?:string,request_timeout?:float} $config */
     public function __construct(array $config)
     {
-        // Извлекаем credentials из конфига
-        $clientId = $config['client_id'];
-        $clientSecret = $config['client_secret'];
-        $this->userId = $config['user_id'] ?: null;
-        $this->rateLimitDelay = (float) ($config['rate_limit_delay'] ?? 8.0);
+        $this->config = $config;
+        $clientId = trim((string) ($config['client_id'] ?? ''));
+        $clientSecret = trim((string) ($config['client_secret'] ?? ''));
+        $this->userId = trim((string) ($config['user_id'] ?? ''));
+        $this->apiBaseUrl = rtrim((string) ($config['api_base_url'] ?? 'https://api.avito.ru'), '/');
+        $this->listRequestDelaySeconds = max(1, (int) ceil((float) ($config['rate_limit_delay'] ?? 8)));
+        $this->requestTimeout = max(5.0, (float) ($config['request_timeout'] ?? 120.0));
 
-        // Создаём Avito OAuth2 провайдер
-        // 
-        // Аргументы:
-        // - clientId: ваш Client ID из интеграции Avito
-        // - clientSecret: ваш Client Secret из интеграции Avito
-        // 
-        // Провайдер автоматически настроит:
-        // - token URL: https://{baseDomain}/token
-        // - authorization URL: https://{baseDomain}/oauth/
-        // - Bearer авторизацию через BearerAuthorizationTrait
+        if ($clientId === '' || $clientSecret === '') {
+            throw new \RuntimeException('Set AVITO_CLIENT_ID and AVITO_CLIENT_SECRET in .env.');
+        }
+        if ($this->userId === '') {
+            throw new \RuntimeException('Set AVITO_USER_ID in .env.');
+        }
+
         $this->provider = new Avito([
             'clientId' => $clientId,
             'clientSecret' => $clientSecret,
-            // baseDomain по умолчанию 'api.avito.ru', но можно переопределить
-            // 'baseDomain' => 'api.avito.ru',
         ]);
 
-        // Устанавливаем baseDomain для контекста аккаунта
-        // 
-        // Важно: setBaseDomain() устанавливает домен, к которому будут 
-        // идти все запросы. Обычно это 'api.avito.ru', но может быть
-        // другим для staging/тестовых сред.
-        // 
-        // В примере из библиотеки setBaseDomain() вызывается при получении
-        // кода авторизации из $_GET['referer'] — это способ привязки
-        // к конкретному аккаунту пользователя.
-        $this->provider->setBaseDomain('api.avito.ru');
-
-        // Получаем HTTP клиент из провайдера
-        // 
-        // $provider->getHttpClient() возвращает настроенный Guzzle Client,
-        // который уже знает базовый URL и может использоваться для
-        // прямых запросов к Avito API с правильной авторизацией.
-        $this->httpClient = $this->provider->getHttpClient();
-
-        // Получаем токен доступа через ClientCredentials grant
-        // 
-        // ClientCredentials — это OAuth2 grant type для server-to-server
-        // аутентификации. Не требует пользователя, использует только
-        // client_id + client_secret.
-        // 
-        // Метод возвращает AccessToken объект, который содержит:
-        // - access_token: строка токена
-        // - expires: timestamp истечения
-        // - token_type: обычно 'Bearer'
-        $this->accessToken = $this->getToken();
+        $this->statsRequestDelaySeconds = max(1, (int) ceil((float) ($config['stats_request_delay_seconds'] ?? 8)));
     }
 
-    /**
-     * Получить/обновить токен доступа
-     *
-     * === Чем отличается от старого refreshToken() ===
-     * 
-     * СТАРЫЙ КОД:
-     * - Ручной POST /token/ через Guzzle
-     * - Ручной парсинг JSON ответа
-     * - Ручная обработка retry
-     * 
-     * НОВЫЙ КОД:
-     * - Использует $provider->getAccessToken(new ClientCredentials())
-     * - Библиотека сама делает POST запрос, парсит ответ
-     * - Библиотека сама обрабатывает ошибки OAuth2
-     * - Мы добавляем свою логику retry поверх
-     *
-     * @return AccessToken Объект токена с методами getToken(), getExpires(), hasExpired()
-     * @throws \RuntimeException если токен не удалось получить
-     */
-    private function getToken(): AccessToken
+    /** Obtain a client-credentials token through avito/oauth2-avito. */
+    public function getToken(): AccessTokenInterface
     {
-        // Проверяем, что credentials заданы
-        // 
-        // Avito провайдер хранит clientId/clientSecret в защищённых свойствах.
-        // Мы проверяем их через публичные геттеры.
-        if (!$this->provider->getClientId() || !$this->provider->getClientSecret()) {
-            throw new \RuntimeException(
-                'Не заданы AVITO_CLIENT_ID и AVITO_CLIENT_SECRET'
-            );
-        }
-
-        $lastError = null;
-
-        // Retry логика: пробуем 3 раза с экспоненциальной задержкой
-        // 
-        // Это наша собственная логика поверх библиотеки.
-        // Библиотека avito/oauth2-avito не включает retry — это
-        // ответственность разработчика.
-        for ($attempt = 0; $attempt < 3; $attempt++) {
-            try {
-                // Создаём grant объект ClientCredentials
-                // 
-                // ClientCredentials говорит OAuth2 клиенту:
-                // - grant_type=client_credentials
-                // - отправить client_id и client_secret в теле запроса
-                // - ожидать JSON ответ с access_token, expires_in, token_type
-                $grant = new ClientCredentials();
-
-                // Получаем токен через провайдер
-                // 
-                // $provider->getAccessToken() делает:
-                // 1. POST {baseDomain}/token с form_params
-                // 2. Парсит JSON ответ
-                // 3. Создаёт и возвращает AccessToken объект
-                // 4. Проверяет статус код (бросает исключение при 4xx/5xx)
-                $token = $this->provider->getAccessToken($grant);
-
-                // AccessToken объект содержит:
-                // - $token->getToken() — строка access_token
-                // - $token->getExpires() — timestamp истечения (или null если perpetual)
-                // - $token->hasExpired() — boolean проверка
-                // - $token->getValues() — полный массив значений из ответа
-                // 
-                // Мы вычитаем 30 секунд из expires_in для запаса
-                // (чтобы не делать запрос с почти истёкшим токеном)
-                return $token;
-            } catch (GuzzleException $e) {
-                $lastError = $e;
-                if ($attempt < 2) {
-                    sleep(5 * ($attempt + 1));
-                }
-            }
-        }
-
-        throw new \RuntimeException(
-            "Не удалось получить токен Avito: " . $lastError->getMessage(),
-            0,
-            $lastError
-        );
-    }
-
-    /**
-     * Соблюдать rate limit
-     * 
-     * === Зачем нужен rate limiting ===
-     * 
-     * Avito API имеет ограничение: 25 запросов в минуту для core API.
-     * Превышение приводит к 429 Too Many Requests.
-     * 
-     * Этот метод гарантирует, что между запросами проходит
-     * минимум $rateLimitDelay секунд.
-     */
-    private function enforceRateLimit(): void
-    {
-        $now = microtime(true);
-        $elapsed = $now - $this->lastRequestTime;
-        
-        // Если с последнего запроса прошло меньше допустимого времени — ждём
-        if ($elapsed < $this->rateLimitDelay) {
-            usleep((int) (($this->rateLimitDelay - $elapsed) * 1_000_000));
-        }
-        
-        // Обновляем время последнего запроса
-        $this->lastRequestTime = microtime(true);
-    }
-
-    /**
-     * Выполнить HTTP-запрос к Avito API
-     *
-     * === Чем отличается от старого request() ===
-     * 
-     * СТАРЫЙ КОД:
-     * - $this->http->request($method, $url, $options)
-     * - Ручное добавление Bearer заголовка
-     * 
-     * НОВЫЙ КОД:
-     * - $this->httpClient->request($method, $url, $options)
-     * - Автоматическое добавление Bearer через $provider->getHeaders($token)
-     * 
-     * === Как работает Bearer авторизация ===
-     * 
-     * Библиотека avito/oauth2-avito использует BearerAuthorizationTrait,
-     * который реализует метод getHeaders(AccessToken $token):
-     * 
-     *   [
-     *     'Authorization' => 'Bearer {access_token}',
-     *     'User-Agent' => 'Avito/oAuth Client 1.0'
-     *   ]
-     * 
-     * Этот метод нужно вызывать для каждого запроса к защищённым API.
-     *
-     * @param string $method HTTP метод (GET, POST, PATCH, etc.)
-     * @param string $path Путь к endpoint (например: /core/v1/items)
-     * @param array $options Опции Guzzle (query, json, headers, timeout)
-     * @return ResponseInterface HTTP ответ
-     */
-    private function request(string $method, string $path, array $options = []): ResponseInterface
-    {
-        // Проверяем, истёк ли токен, и обновляем при необходимости
-        // 
-        // AccessToken::hasExpired() проверяет:
-        // - Есть ли expires в токене
-        // - Не наступил ли timestamp истечения
-        // 
-        // Мы вычитаем 30 секунд для запаса (same as before)
         if ($this->accessToken === null || $this->accessToken->hasExpired()) {
-            $this->accessToken = $this->getToken();
+            $this->accessToken = $this->provider->getAccessToken('client_credentials');
         }
 
-        $this->enforceRateLimit();
+        return $this->accessToken;
+    }
 
-        // Получаем заголовки авторизации из провайдера
-        // 
-        // $provider->getHeaders($token) возвращает массив:
-        // [
-        //     'Authorization' => 'Bearer {token_string}',
-        //     'User-Agent' => 'Avito/oAuth Client 1.0'
-        // ]
-        // 
-        // Это заменяет ручное формирование:
-        // 'Authorization' => 'Bearer ' . $this->token
-        $headers = $options['headers'] ?? [];
-        $authHeaders = $this->provider->getHeaders($this->accessToken);
-        $headers = array_merge($headers, $authHeaders);
-        $options['headers'] = $headers;
-        $options['timeout'] = $options['timeout'] ?? 30;
-
-        $url = $path;
-        if (!str_starts_with($path, '/')) {
-            $url = '/' . $path;
+    /** @return array<string, mixed> */
+    public function getItemById(int $itemId): array
+    {
+        if ($itemId <= 0) {
+            throw new \InvalidArgumentException('Item ID must be a positive integer.');
         }
 
-        $maxRetries = $options['_retries'] ?? 3;
-        $retryAttempt = $options['_retry_attempt'] ?? 0;
-        $retryDelayBase = $options['_retry_delay_base'] ?? 60;
+        return $this->requestJson('GET', '/core/v1/items/' . $itemId);
+    }
 
-        unset($options['_retries'], $options['_retry_attempt'], $options['_retry_delay_base']);
+    /**
+     * Request item statistics grouped by day or as one period total.
+     *
+     * @param list<int> $itemIds
+     * @return list<array<string, mixed>>
+     */
+    public function getStatsV2(array $itemIds, string $dateFrom, string $dateTo, string $grouping = 'item'): array
+    {
+        if ($itemIds === []) {
+            return [];
+        }
 
-        $lastException = null;
+        $payload = [
+            'itemIds' => array_values($itemIds),
+            'dateFrom' => $dateFrom,
+            'dateTo' => $dateTo,
+            'grouping' => $grouping,
+        ];
 
-        for ($attempt = 0; $attempt < $maxRetries; $attempt++) {
-            try {
-                // Выполняем запрос через HTTP клиент из провайдера
-                // 
-                // $this->httpClient — это тот же Guzzle Client, что и раньше,
-                // но инициализирован через $provider->getHttpClient()
-                $resp = $this->httpClient->request($method, $url, $options);
+        $response = $this->requestJson('POST', sprintf('/stats/v1/accounts/%s/items', rawurlencode($this->userId)), $payload);
 
-                // 429 — ждём 30 сек
-                if ($resp->getStatusCode() === 429) {
-                    sleep(30);
-                    $this->enforceRateLimit();
-                    continue;
-                }
+        return $response['result']['items'] ?? $response['items'] ?? [];
+    }
 
-                return $resp;
-            } catch (GuzzleException $e) {
-                $lastException = $e;
+    /** @param list<int> $itemIds @return list<array<string, mixed>> */
+    public function getStats(array $itemIds, string $dateFrom, string $dateTo): array
+    {
+        return $this->getStatsV2($itemIds, $dateFrom, $dateTo);
+    }
 
-                // Retry при connection errors
-                if ($e instanceof \GuzzleHttp\Exception\ConnectException
-                    || str_contains($e->getMessage(), 'Connection')
-                ) {
-                    $wait = $retryDelayBase * ($attempt + 1);
-                    echo "\n  [WARN] Connection error (attempt " . ($attempt + 1) . "/{$maxRetries}), wait {$wait}s...\n";
-                    sleep($wait);
-                } else {
-                    throw $e;
-                }
+    /**
+     * Запрос статистики с паузой и разбивкой по месяцам.
+     *
+     * @param list<int> $itemIds
+     * @return list<array<string, mixed>>
+     */
+    public function getStatsWithDelay(array $itemIds, string $dateFrom, string $dateTo, string $grouping = 'item'): array
+    {
+        // Пауза перед первым запросом
+        if ($this->statsRequestDelaySeconds > 0) {
+            sleep($this->statsRequestDelaySeconds);
+        }
+
+        // Разбиваем период на чанки по месяцам
+        $chunks = $this->splitPeriodIntoMonths($dateFrom, $dateTo);
+        $allStats = [];
+
+        foreach ($chunks as $chunkIndex => [$chunkFrom, $chunkTo]) {
+            $chunkStats = $this->getStatsV2($itemIds, $chunkFrom, $chunkTo, $grouping);
+            $allStats = array_merge($allStats, $chunkStats);
+
+            // Пауза между чанками
+            if ($chunkIndex < count($chunks) - 1 && $this->statsRequestDelaySeconds > 0) {
+                sleep($this->statsRequestDelaySeconds);
             }
         }
 
-        throw new \RuntimeException(
-            "Max retries exceeded: " . $lastException->getMessage(),
-            0,
-            $lastException
-        );
+        return $allStats;
     }
 
-    // ==================== Public API Methods ====================
+    /**
+     * Разбить период на чанки по месяцам (макс. 270 дней на чанк).
+     *
+     * @return list<array{0:string, 1:string}>
+     */
+    public static function splitPeriodIntoMonths(string $dateFrom, string $dateTo): array
+    {
+        $chunks = [];
+        $current = new \DateTimeImmutable($dateFrom);
+        $end = new \DateTimeImmutable($dateTo);
+
+        while ($current <= $end) {
+            $lastDay = (clone $current)->modify('last day of this month 23:59:59');
+            $chunkEnd = $lastDay < $end ? $lastDay : $end;
+            $chunks[] = [$current->format('Y-m-d'), $chunkEnd->format('Y-m-d')];
+            $current = $chunkEnd->modify('+1 day');
+        }
+
+        return $chunks;
+    }
 
     /**
-     * Получить список объявлений
+     * Get a list of items with pagination.
+     *
+     * @param list<string> $statuses Filter by statuses (e.g. ['active'])
+     * @return array{resources?: list<array<string, mixed>>, total?: int}
      */
-    public function listItems(
-        string $status = 'active',
-        int $perPage = 50,
-        int $page = 1
-    ): array {
+    public function listItems(array $statuses = ['active'], int $page = 1, int $perPage = 50): array
+    {
+        $query = array_merge(
+            ['status' => implode(',', $statuses), 'per_page' => $perPage, 'page' => $page],
+            ['user_id' => $this->userId]
+        );
+
+        return $this->requestJson('GET', '/core/v1/items', $query);
+    }
+
+    /**
+     * Get ALL items (paginated) with a given status.
+     *
+     * @param list<string> $statuses
+     * @return list<array<string, mixed>>
+     */
+    public function getAllItems(array $statuses = ['active'], int $perPage = 100, ?callable $onPage = null): array
+    {
+        $all = [];
+        $page = 1;
+        $totalFetched = 0;
+
+        do {
+            $result = $this->listItems($statuses, $page, $perPage);
+            $resources = $result['resources'] ?? [];
+
+            if ($resources === []) {
+                break;
+            }
+
+            $all = array_merge($all, $resources);
+            $totalFetched += count($resources);
+
+            $total = (int) ($result['total'] ?? 0);
+            if ($onPage !== null) {
+                $onPage($page, $totalFetched, $total);
+            }
+            // API не возвращает корректный total (всегда 0).
+            // Продолжаем, пока не получим пустую страницу.
+            // Прерываемся после 500 страниц (~50000 items) как защита от бесконечного цикла.
+            if ($page >= 500) {
+                break;
+            }
+
+            $page++;
+            // GET /core/v1/items ограничен 25 запросами в минуту.
+            // Используем ту же консервативную паузу, что и проверочный test_item.php.
+            sleep($this->listRequestDelaySeconds);
+        } while (true);
+
+        return $all;
+    }
+
+    /**
+     * Get detailed information about a single item (includes views, contacts, etc.).
+     *
+     * @return array<string, mixed>
+     */
+    public function getItemDetail(int $itemId): array
+    {
+        return $this->requestJson('GET', sprintf('/core/v1/accounts/%s/items/%d', rawurlencode($this->userId), $itemId));
+    }
+
+    /**
+     * Get full item data from /core/v1/items/{id}
+     * Returns fields not available in list endpoint: brand, oem_number, contact_block, etc.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function getFullItem(int $itemId): ?array
+    {
         try {
-            $resp = $this->request('GET', '/core/v1/items', [
-                'query' => [
-                    'status' => $status,
-                    'per_page' => $perPage,
-                    'page' => $page,
-                ],
+            return $this->requestJson('GET', '/core/v1/items/' . $itemId);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Count items by status.
+     *
+     * @return array<string, int>  e.g. ['active' => 12, 'draft' => 3]
+     */
+    public function countAllStatuses(): array
+    {
+        $counts = [];
+        $statuses = ['active', 'closed', 'draft', 'moderation', 'rejected', 'archived'];
+
+        foreach ($statuses as $index => $status) {
+            // Пауза между запросами для разных статусов (лимит 25 req/min)
+            if ($index > 0 && $this->listRequestDelaySeconds > 0) {
+                sleep($this->listRequestDelaySeconds);
+            }
+            try {
+                $result = $this->listItems([$status], 1, 1);
+                $counts[$status] = (int) ($result['total'] ?? 0);
+            } catch (\Throwable $e) {
+                $counts[$status] = 0;
+            }
+        }
+
+        return $counts;
+    }
+
+    /**
+     * Search for an item by its public number (e.g. "8012519823").
+     *
+     * @return array<string, mixed>|null
+     */
+    public function searchItemByNumber(string $number): ?array
+    {
+        try {
+            $result = $this->requestJson('GET', '/core/v1/items', [
+                'user_id' => $this->userId,
+                'id' => $number,
+                'per_page' => 1,
             ]);
 
-            if ($resp->getStatusCode() !== 200) {
-                return [];
+            $resources = $result['resources'] ?? [];
+            if ($resources !== []) {
+                return $resources[0];
             }
 
-            $data = json_decode((string) $resp->getBody(), true);
-            return $data['resources'] ?? [];
-        } catch (\Exception $e) {
-            echo "[WARN] listItems error: " . $e->getMessage() . "\n";
+            return null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Деактивировать объявление на Avito.
+     *
+     * @return array{success: bool, message?: string}
+     */
+    public function deactivateItem(int $itemId): array
+    {
+        try {
+            $this->requestJson('POST', sprintf('/core/v1/items/%d/deactivate', $itemId));
+            return ['success' => true];
+        } catch (\Throwable $e) {
+            return ['success' => false, 'message' => $e->getMessage()];
+        }
+    }
+
+    /**
+     * Get images for a specific item.
+     *
+     * @return list<array{url?: string, slug?: string, thumb_url?: string}>
+     */
+    public function getImages(int $itemId): array
+    {
+        try {
+            $result = $this->requestJson('GET', '/images/v1/items/' . $itemId . '/images');
+            return $result['images'] ?? $result['resources'] ?? [];
+        } catch (\Throwable $e) {
             return [];
         }
     }
 
-    /**
-     * Получить ВСЕ объявления (авто-пагинация)
-     */
-    public function getAllItems(string $status = 'active'): array
+    /** @return array<string, mixed> */
+    private function requestJson(string $method, string $path, ?array $json = null): array
     {
-        $allItems = [];
-        $page = 1;
-        $pageSize = 50;
+        $maxRetries = (int) ($this->config['max_retries'] ?? 3);
+        $retryDelayBase = (int) ($this->config['retry_delay_base'] ?? 65);
 
-        while (true) {
-            $items = $this->listItems($status, $pageSize, $page);
-            if (empty($items)) {
-                break;
+        for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
+            $options = [
+                'headers' => ['Accept' => 'application/json'],
+                'timeout' => $this->requestTimeout,
+            ];
+            if ($json !== null) {
+                if (strtoupper($method) === 'GET') {
+                    $query = http_build_query($json, '', '&', PHP_QUERY_RFC3986);
+                    if ($query !== '') {
+                        $path .= '?' . $query;
+                    }
+                } else {
+                    $options['headers']['Content-Type'] = 'application/json';
+                    $options['body'] = json_encode($json, JSON_THROW_ON_ERROR);
+                }
             }
-            $allItems = array_merge($allItems, $items);
-            $page++;
-            if (count($items) < $pageSize) {
-                break;
+
+            try {
+                $request = $this->provider->getAuthenticatedRequest(
+                    $method,
+                    $this->apiBaseUrl . $path,
+                    $this->getToken(),
+                    $options
+                );
+                $response = $this->provider->getResponse($request);
+                return $this->decodeResponse($response);
+            } catch (\GuzzleHttp\Exception\RequestException $e) {
+                $response = $e->getResponse();
+                $statusCode = $response ? $response->getStatusCode() : 0;
+
+                // Retry только для 429 (Too Many Requests) и 5xx
+                if (($statusCode === 429 || ($statusCode >= 500 && $statusCode < 600)) && $attempt < $maxRetries) {
+                    $delay = $retryDelayBase * ((int) pow(2, $attempt));
+                    fwrite(STDERR, "  [RETRY #$attempt] HTTP $statusCode — ждём {$delay} сек...\n");
+                    sleep($delay);
+                    continue;
+                }
+
+                throw $e;
             }
         }
 
-        return
+        // Should not reach here, but just in case
+        throw new \RuntimeException("requestJson failed after $maxRetries retries");
+    }
+
+    /** @return array<string, mixed> */
+    private function decodeResponse(ResponseInterface $response): array
+    {
+        $body = (string) $response->getBody();
+        $data = $body === '' ? [] : json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+
+        if ($response->getStatusCode() >= 400) {
+            $message = is_array($data) ? (string) ($data['message'] ?? $body) : $body;
+            throw new \RuntimeException(sprintf('Avito API returned HTTP %d: %s', $response->getStatusCode(), $message));
+        }
+
+        return is_array($data) ? $data : [];
+    }
+}

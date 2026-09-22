@@ -20,5 +20,8 @@
         "psr-4": {
             "App\\Tests\\": "tests/"
         }
+    },
+    "scripts": {
+        "item-stats": "php bin/item-stats.php"
     }
 }
