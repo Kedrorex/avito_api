@@ -10,7 +10,7 @@
 
 declare(strict_types=1);
 
-$rootDir = __DIR__;
+$rootDir = dirname(__DIR__);
 require $rootDir . '/vendor/autoload.php';
 
 use App\Repositories\ItemRepository;
@@ -157,6 +157,41 @@ assertTest((int)$today[0]['views'] === 0, "Zero views stored correctly");
 echo "\n--- Test 10: getStats for non-existent ad ---\n";
 $noStats = $repo->getStats(999999);
 assertTest($noStats === [], "Empty array for non-existent ad");
+
+// ===== ТЕСТ 11: unique_id из API =====
+echo "\n--- Test 11: unique_id from API ---\n";
+$isNew = $repo->upsertFromApiItem([
+    'id' => '9000000003',
+    'number' => '8000000004',
+    'title' => 'Товар с unique_id',
+    'status' => 'active',
+    'created_at' => '2026-09-01T10:00:00',
+    'uniqueId' => 'autoload_abc123xyz',
+]);
+assertTest($isNew === true, "Returns true for new item with uniqueId");
+
+$ad = $repo->getByAvitoId('9000000003');
+assertTest($ad !== null, "Found by avito_id 9000000003");
+assertTest($ad['unique_id'] === 'autoload_abc123xyz', "unique_id saved correctly");
+
+// Обновление с новым uniqueId
+$isNew = $repo->upsertFromApiItem([
+    'id' => '9000000003',
+    'number' => '8000000004',
+    'title' => 'Обновлённый товар',
+    'status' => 'active',
+    'uniqueId' => 'autoload_updated456',
+]);
+assertTest($isNew === false, "Returns false for existing item");
+
+$ad = $repo->getByAvitoId('9000000003');
+assertTest($ad['unique_id'] === 'autoload_updated456', "unique_id updated correctly");
+
+// ===== ТЕСТ 12: getByUniqueId =====
+echo "\n--- Test 12: getByUniqueId ---\n";
+$byUniqueId = $repo->getByUniqueId('autoload_updated456');
+assertTest($byUniqueId !== null, "Found by unique_id");
+assertTest((int)$byUniqueId['id'] === (int)$ad['id'], "Correct record by unique_id");
 
 // ===== ИТОГ =====
 echo "\n" . str_repeat('=', 70) . "\n";

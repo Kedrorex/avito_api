@@ -24,6 +24,9 @@ return function (App $app) {
     // Переопубликовать объявление
     $app->post('/republish/{id}', \App\Controllers\AvitoController::class . ':republish');
 
+    // Массовая републикация кандидатов (требует явного указания количества)
+    $app->post('/republish-batch', \App\Controllers\AvitoController::class . ':republishBatch');
+
     // Подсчёт по статусам
     $app->get('/status-counts', \App\Controllers\AvitoController::class . ':countByStatus');
 
@@ -38,4 +41,7 @@ return function (App $app) {
     // Генерация фида для Avito AutoLoad
     $app->post('/feed/generate', \App\Controllers\AvitoController::class . ':generateFeed');
     $app->get('/feed/info', \App\Controllers\AvitoController::class . ':getFeedInfo');
+
+    // Генерация фидов для переопубликования
+    $app->post('/republish-feeds', \App\Controllers\AvitoController::class . ':generateRepublishFeeds');
 };

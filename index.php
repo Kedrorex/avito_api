@@ -59,13 +59,17 @@ if ($cli) {
         $apiClient,
         $repository,
         $republisher,
-        $config['avito']
+        $pdo,
+        $config
     );
 
     // Dispatch команд
     switch ($command) {
         case 'run':
             $controller->run();
+            break;
+        case 'feed-only':
+            $controller->runFeedOnly();
             break;
         case 'sync':
             echo $controller->sync() . "\n";
@@ -83,6 +87,21 @@ if ($cli) {
                 exit(1);
             }
             echo $controller->republish((int) $adId) . "\n";
+            break;
+        case 'republish-all':
+            $maxCount = isset($argv[2]) ? (int) $argv[2] : 0;
+            if ($maxCount <= 0) {
+                echo "Usage: php index.php republish-all <count: 1..70>\n";
+                echo "  ВАЖНО: републикация происходит ТОЛЬКО при явном указании количества.\n";
+                echo "  Автоматическая републикация запрещена.\n";
+                exit(1);
+            }
+            $maxDailyRepub = (int) ($config['avito']['max_daily_repub'] ?? 70);
+            if ($maxCount > $maxDailyRepub) {
+                echo "  [ERROR] Запрошено {$maxCount}, но дневной лимит: {$maxDailyRepub}\n";
+                exit(1);
+            }
+            $controller->republishBatch($maxCount, true);
             break;
         case 'stats':
             $dateFrom = $argv[2] ?? date('Y-m-d', strtotime('-30 days'));
@@ -114,7 +133,8 @@ if ($cli) {
             echo $controller->getItemDetail((int) $itemId) . "\n";
             break;
         case 'collect-candidates':
-            $days = isset($argv[2]) ? (int) $argv[2] : 4;
+            $configCandidateDays = (int) ($config['avito']['candidate_days'] ?? 4);
+            $days = isset($argv[2]) ? (int) $argv[2] : $configCandidateDays;
             $controller->collectCandidates($days);
             break;
         case 'show-candidates':
@@ -130,7 +150,7 @@ if ($cli) {
                     $priorityMode = true;
                 }
             }
-            $feedGenerator = new \App\Services\FeedGeneratorService($repository, $config);
+            $feedGenerator = new \App\Services\FeedGeneratorService($repository, $apiClient, $config);
             $result = $feedGenerator->generate($priorityMode);
             if ($result['count'] > 0) {
                 echo "\n  Заголовки (первые 5):\n";
@@ -142,7 +162,7 @@ if ($cli) {
             }
             break;
         case 'feed-info':
-            $feedGenerator = new \App\Services\FeedGeneratorService($repository, $config);
+            $feedGenerator = new \App\Services\FeedGeneratorService($repository, $apiClient, $config);
             $info = $feedGenerator->getLastGeneration();
             if (empty($info)) {
                 echo "  Нет сгенерированных файлов\n";
@@ -151,6 +171,19 @@ if ($cli) {
                 echo "  Дата:   {$info['last_date']}\n";
                 echo "  Объявл: {$info['last_count']}\n";
             }
+            break;
+        case 'republish-feeds':
+            $count = isset($argv[2]) ? (int) $argv[2] : 0;
+            if ($count <= 0) {
+                echo "Usage: php index.php republish-feeds <count: 1..70>\n";
+                echo "  Генерирует ОДИН TSV фид для переопубликования:\n";
+                echo "  Формат: mixed operations (remove + update в одном файле)\n";
+                echo "  Avito AutoLoad обрабатывает фид последовательно:\n";
+                echo "    1. Сначала все remove (снять с публикации)\n";
+                echo "    2. Затем все update (вновь включить с полными данными)\n";
+                exit(1);
+            }
+            $controller->generateRepublishFeeds($count, true);
             break;
         case 'analyze':
             $analysis = new \App\Services\AnalysisService($repository, $config);
@@ -215,9 +248,32 @@ if ($cli) {
                     . " rules=" . implode(',', $analysisResult['matched_rules']) . "\n";
             }
             break;
+        case 'migrate-unique-id':
+            // Миграция: заполняет unique_id из master_data для существующих объявлений
+            echo "\n  Миграция unique_id для существующих объявлений...\n";
+            $activeAds = $repository->getActive();
+            $updated = 0;
+            $skipped = 0;
+            foreach ($activeAds as $ad) {
+                if (!empty($ad['unique_id'])) {
+                    $skipped++;
+                    continue;
+                }
+                $masterData = $ad['master_data'] ? json_decode($ad['master_data'], true) : [];
+                $uniqueId = $masterData['unique_id'] ?? '';
+                if ($uniqueId !== '') {
+                    $repository->updatePhysical((int) $ad['id'], ['unique_id' => $uniqueId]);
+                    $updated++;
+                } else {
+                    $skipped++;
+                }
+            }
+            echo "  Обновлено: {$updated}\n";
+            echo "  Пропущено (уже есть unique_id или нет в master_data): {$skipped}\n";
+            break;
         default:
             echo "Unknown command: {$command}\n";
-            echo "Available: run, sync, active, status-counts, republish, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, analyze, analyze-report\n";
+            echo "Available: run, feed-only, sync, active, status-counts, republish, republish-all, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, republish-feeds, analyze, analyze-report, migrate-unique-id\n";
             exit(1);
     }
 } else {

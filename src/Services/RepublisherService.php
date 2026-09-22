@@ -49,8 +49,8 @@ class RepublisherService
         for ($i = 0; $i < count($active); $i += 200) {
             $batch = array_slice($active, $i, 200);
             $itemIds = array_filter(
-                array_map(fn($ad) => $ad['avito_id'] ?? null, $batch),
-                fn($id) => $id !== null
+                array_map(fn($ad) => (int) ($ad['avito_id'] ?? 0), $batch),
+                fn($id) => $id > 0
             );
 
             if (empty($itemIds)) {
@@ -77,18 +77,37 @@ class RepublisherService
                 );
             }
 
-            // Сохраняем статистику в БД
-            foreach ($batch as $ad) {
-                $avitoId = (string) ($ad['avito_id'] ?? '');
-                if (!isset($statsByItem[$avitoId])) {
-                    continue;
-                }
+            // Сохраняем статистику в БД с транзакцией и обработкой ошибок
+            $savedCount = 0;
+            $failedCount = 0;
+            $this->repository->beginTransaction();
+            try {
+                foreach ($batch as $ad) {
+                    $avitoId = (string) ($ad['avito_id'] ?? '');
+                    if (!isset($statsByItem[$avitoId])) {
+                        continue;
+                    }
 
-                $this->repository->saveStats((int) $ad['id'], $statsByItem[$avitoId]);
+                    try {
+                        $this->repository->saveStats((int) $ad['id'], $statsByItem[$avitoId]);
+                        $savedCount++;
+                    } catch (\Throwable $e) {
+                        $failedCount++;
+                        fwrite(
+                            STDERR,
+                            "  [WARN] Failed to save stats for ad {$avitoId}: " . $e->getMessage() . "\n"
+                        );
+                    }
+                }
+                $this->repository->commit();
+            } catch (\Throwable $e) {
+                $this->repository->rollBack();
+                fwrite(STDERR, "  [ERROR] Transaction failed: " . $e->getMessage() . "\n");
+                throw $e;
             }
 
             echo "  Собрано статистики для " . count($itemIds) . " объявлений: "
-                . count($statsList) . " записей\n";
+                . count($statsList) . " записей (saved: {$savedCount}, failed: {$failedCount})\n";
         }
     }
 
@@ -220,11 +239,10 @@ class RepublisherService
      *
      * Делегирует AnalysisService — настраиваемые пороги вместо хардкода.
      * Обратная совместимость: возвращает только массивы объявлений.
+     *
+     * Правила анализа настраиваются через config['analysis_thresholds'].
      */
-    public function findCandidates(
-        int $days = 3,
-        int $threshold = 0
-    ): array {
+    public function findCandidates(): array {
         $analysis = new AnalysisService($this->repository, $this->config);
         $results = $analysis->findAllCandidates();
 
@@ -235,9 +253,9 @@ class RepublisherService
     /**
      * Переопубликовать одно объявление
      *
-     * @return int|null ID нового поколения или null при ошибке
+     * @return array{success: bool, avito_id: string, new_id?: int, message?: string}
      */
-    public function republish(array $ad): ?int
+    public function republish(array $ad): array
     {
         $maxDailyRepub = (int) ($this->config['max_daily_repub'] ?? 70);
         $today = date('Y-m-d');
@@ -245,8 +263,7 @@ class RepublisherService
 
         // Проверка дневного лимита
         if ($dailyCount >= $maxDailyRepub) {
-            echo "  [SKIP] Дневной лимит ({$maxDailyRepub}) исчерпан\n";
-            return null;
+            return ['success' => false, 'avito_id' => (string) ($ad['avito_id'] ?? ''), 'message' => "Дневной лимит ({$maxDailyRepub}) исчерпан"];
         }
 
         $avitoId = (string) ($ad['avito_id'] ?? '');
@@ -255,8 +272,7 @@ class RepublisherService
         if ($avitoId !== '') {
             $result = $this->apiClient->deactivateItem((int) $avitoId);
             if (!$result['success']) {
-                echo "  [ERROR] Не удалось деактивировать {$avitoId}: " . ($result['message'] ?? 'unknown') . "\n";
-                return null;
+                return ['success' => false, 'avito_id' => $avitoId, 'message' => 'Не удалось деактивировать: ' . ($result['message'] ?? 'unknown')];
             }
         }
 
@@ -266,7 +282,7 @@ class RepublisherService
             'deactivated_at' => date('Y-m-d H:i:s'),
         ]);
 
-        // 2. Создаём новое поколение
+        // 2. Создаём новое поколение — копируем все поля из старого
         $masterData = $ad['master_data'] ? json_decode($ad['master_data'], true) : [];
         $newId = $this->repository->createPhysical(
             $ad['logical_key'],
@@ -274,16 +290,119 @@ class RepublisherService
             'active'
         );
 
+        // Копируем все feed-колонки из старого объявления
         $this->repository->updatePhysical($newId, [
             'published_at' => date('Y-m-d H:i:s'),
             'old_avito_id' => $avitoId ?: null,
+            'unique_id' => $ad['unique_id'] ?? null,
+            'phone' => $ad['phone'] ?? null,
+            'contact_method' => $ad['contact_method'] ?? null,
+            'brand' => $ad['brand'] ?? null,
+            'oem_number' => $ad['oem_number'] ?? null,
+            'images' => $ad['images'] ?? null,
+            'title' => $ad['title'] ?? null,
+            'description' => $ad['description'] ?? null,
+            'location' => $ad['location'] ?? null,
+            'price' => $ad['price'] ?? 0,
+            'category_params' => $ad['category_params'] ?? null,
         ]);
 
         $newDailyCount = $dailyCount + 1;
         echo "  [REPUB] {$avitoId} -> новое поколение #{$newId} "
             . "(всего сегодня: {$newDailyCount}/{$maxDailyRepub})\n";
 
-        return $newId;
+        return ['success' => true, 'avito_id' => $avitoId, 'new_id' => $newId];
+    }
+
+    /**
+     * Массовая републикация кандидатов в количестве, указанном пользователем.
+     *
+     * ВАЖНО: републикация происходит ТОЛЬКО при явном указании количества.
+     * Автоматическая републикация всех кандидатов запрещена.
+     *
+     * @param list<array> $candidates Список кандидатов на републикацию
+     * @param int $maxCount Максимальное количество для републикации (явный выбор пользователя)
+     * @return array{total_candidates: int, requested: int, republished: int, skipped: int, failed: int}
+     */
+    public function republishBatch(array $candidates, int $maxCount): array
+    {
+        $maxDailyRepub = (int) ($this->config['max_daily_repub'] ?? 70);
+        $today = date('Y-m-d');
+        $dailyCount = $this->repository->getDailyRepubCount($today);
+
+        $remaining = $maxDailyRepub - $dailyCount;
+        if ($remaining <= 0) {
+            echo "  [SKIP] Дневной лимит ({$maxDailyRepub}) уже исчерпан (уже републиковано: {$dailyCount})\n";
+            return [
+                'total_candidates' => count($candidates),
+                'requested' => $maxCount,
+                'republished' => 0,
+                'skipped' => 0,
+                'failed' => 0,
+            ];
+        }
+
+        // Реальное ограничение — минимум из запрошенного и оставшегося лимита
+        $actualCount = min($maxCount, $remaining, count($candidates));
+
+        if ($actualCount <= 0) {
+            echo "  [SKIP] Нечего републиковать\n";
+            return [
+                'total_candidates' => count($candidates),
+                'requested' => $maxCount,
+                'republished' => 0,
+                'skipped' => 0,
+                'failed' => 0,
+            ];
+        }
+
+        echo "\n  ============================================\n";
+        echo "  РЕПУБЛИКАЦИЯ: {$actualCount} объявлений\n";
+        echo "  (запрошено: {$maxCount}, доступно лимита: {$remaining}, кандидатов: " . count($candidates) . ")\n";
+        echo "  ============================================\n\n";
+
+        $republished = 0;
+        $skipped = 0;
+        $failed = 0;
+
+        // Транзакция на весь батч
+        $this->repository->beginTransaction();
+        try {
+            for ($i = 0; $i < $actualCount; $i++) {
+                $ad = $candidates[$i];
+                $result = $this->republish($ad);
+
+                if ($result['success']) {
+                    $republished++;
+                } else {
+                    $failed++;
+                    echo "  [FAIL] {$result['avito_id']}: {$result['message']}\n";
+                }
+            }
+            $this->repository->commit();
+        } catch (\Throwable $e) {
+            $this->repository->rollBack();
+            echo "  [ERROR] Транзакция откатана: " . $e->getMessage() . "\n";
+            throw $e;
+        }
+
+        $skipped = count($candidates) - $actualCount;
+
+        echo "\n  ============================================\n";
+        echo "  ИТОГО РЕПУБЛИКАЦИЯ:\n";
+        echo "    Успешно: {$republished}\n";
+        echo "    Ошибки:  {$failed}\n";
+        echo "    Пропущено: {$skipped}\n";
+        echo "    Лимит сегодня: " . ($dailyCount + $republished) . "/{$maxDailyRepub}\n";
+        echo "  ============================================\n";
+
+        return [
+            'total_candidates' => count($candidates),
+            'requested' => $maxCount,
+            'republished' => $republished,
+            'skipped' => $skipped,
+            'failed' => $failed,
+        ];
     }
 
     /**
@@ -301,7 +420,9 @@ class RepublisherService
      */
     public function collectCandidates(int $days = 4): array
     {
-        $candidateDays = (int) ($this->config['candidate_days'] ?? $days);
+        // CLI параметр имеет приоритет над конфигом (динамический выбор пользователя)
+        $configDays = (int) ($this->config['candidate_days'] ?? 4);
+        $candidateDays = $days > 0 ? $days : $configDays;
         $candidates = $this->repository->findZeroViewCandidates($candidateDays);
 
         $found = count($candidates);

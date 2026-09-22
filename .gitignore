@@ -2,3 +2,7 @@
 /data/*.db
 /data/backups/*.db
 /.env
+/.vscode/
+/swager_avito/
+/tests/
+/.gigacode_vsc/

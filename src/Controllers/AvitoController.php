@@ -6,7 +6,9 @@ use App\Repositories\ItemRepository;
 use App\Services\AnalysisService;
 use App\Services\AvitoAPIClient;
 use App\Services\FeedGeneratorService;
+use App\Services\RepublishFeedService;
 use App\Services\RepublisherService;
+use PDO;
 
 /**
  * Контроллер для работы с Avito API
@@ -17,17 +19,20 @@ class AvitoController
     private AvitoAPIClient $apiClient;
     private ItemRepository $repository;
     private RepublisherService $republisher;
+    private PDO $pdo;
     private array $config;
 
     public function __construct(
         AvitoAPIClient $apiClient,
         ItemRepository $repository,
         RepublisherService $republisher,
+        PDO $pdo,
         array $config
     ) {
         $this->apiClient = $apiClient;
         $this->repository = $repository;
         $this->republisher = $republisher;
+        $this->pdo = $pdo;
         $this->config = $config;
     }
 
@@ -40,57 +45,192 @@ class AvitoController
         echo str_repeat('=', 60) . "\n";
         echo "  Avito Republisher -- Start\n";
         echo str_repeat('=', 60) . "\n";
+        flush();
 
         // 1. Синхронизация с API
         echo "\n  --- Sync ---\n";
-        $items = $this->apiClient->getAllItems(['active']);
-        $synced = $this->repository->syncFromApi($items);
+        flush();
+        $items = $this->apiClient->getAllItems(['active'], 100, function(int $page, int $fetched, int $total): void {
+            echo "    Fetched {$fetched} items (page {$page})...\n";
+            flush();
+        });
+        $syncResult = $this->repository->syncFromApi($items);
         $active = $this->repository->getActive();
-        echo "  Active ads in DB: " . count($active) . "\n";
+        
+        echo "  Создано новых: " . $syncResult['created'] . "\n";
+        echo "  Обновлено: " . $syncResult['updated'] . "\n";
+        echo "  Удалено (снято с публикации): " . $syncResult['removed'] . "\n";
+        if (!empty($syncResult['removed_ids'])) {
+            echo "  Удалённые avito_id: " . implode(', ', $syncResult['removed_ids']) . "\n";
+        }
+        echo "  Active ads в БД: " . count($active) . "\n";
 
         if (empty($active)) {
             echo "  No active ads -- exit\n";
             return;
         }
 
+        $hasNewAds = $syncResult['created'] > 0;
+
+        // 2. Импорт данных из AutoLoad CSV (только если появились новые объявления)
+        if ($hasNewAds) {
+            echo "\n  --- Import AutoLoad Feed ---\n";
+            flush();
+            $feedPath = $this->config['feed']['autoload_source'] ?? __DIR__ . '/../../fid/Рабочий образец.csv';
+            
+            if (file_exists($feedPath)) {
+                echo "  Файл найден: {$feedPath}\n";
+                echo "  Появились новые объявления. Импортировать данные из AutoLoad CSV?\n";
+                echo "  [y/N] ";
+                
+                $handle = fopen('php://stdin', 'r');
+                $response = trim(fgets($handle)) ?? '';
+                fclose($handle);
+                
+                if (strtolower($response) === 'y') {
+                    $imported = $this->importAutoloadFeed($feedPath);
+                    echo "  Импортировано: {$imported} объявлений\n";
+                } else {
+                    echo "  Импорт пропущен\n";
+                }
+            } else {
+                echo "  AutoLoad CSV не найден: {$feedPath}\n";
+                echo "  Скачайте фид из Avito (Настройки → Автовыгрузка → Скачать фид)\n";
+                echo "  и положите в: {$feedPath}\n";
+            }
+        } else {
+            echo "\n  Новых объявлений нет — импорт AutoLoad CSV пропускается\n";
+        }
+
         // 2. Сбор статистики
         echo "\n  --- Collect Stats ---\n";
-        $this->republisher->collectStats(3);
+        flush();
+        $statsDays = (int) ($this->config['avito']['stats_days'] ?? 3);
+        $this->republisher->collectStats($statsDays);
 
-        // 3. Поиск кандидатов
+        // 3. Поиск кандидатов (запись в republish_candidates_*)
         echo "\n  --- Find Candidates ---\n";
-        $candidates = $this->republisher->findCandidates(3, 0);
-        echo "  Candidates found: " . count($candidates) . "\n";
+        flush();
+        $candidateResult = $this->republisher->collectCandidates(4);
+        echo "  Найдено: {$candidateResult['found']}\n";
+        echo "  Добавлено: {$candidateResult['added']}\n";
+        echo "  Уже были: {$candidateResult['skipped']}\n";
 
-        foreach (array_slice($candidates, 0, 5) as $i => $ad) {
-            $stats = $this->repository->getStats((int) $ad['id']);
-            $recent = array_slice($stats, -3);
-            $views = array_sum(array_map(fn($s) => (int) ($s['views'] ?? $s['uniq_views'] ?? 0), $recent));
-            $contacts = array_sum(array_map(fn($s) => (int) ($s['contacts'] ?? $s['uniq_contacts'] ?? 0), $recent));
-            echo "    " . ($i + 1) . ". avito_id=" . ($ad['avito_id'] ?? 'N/A')
-                . "  views={$views}  contacts={$contacts}\n";
+        // 4. Генерация фида
+        echo "\n  --- Generate Feed ---\n";
+        flush();
+        $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config);
+        $feedResult = $feedGenerator->generate(false);
+        if ($feedResult['count'] > 0) {
+            echo "  Фид: {$feedResult['file']} ({$feedResult['count']} объявлений, " . count($feedResult['headers']) . " столбцов)\n";
         }
 
-        // 4. Республикация
-        echo "\n  --- Republish ---\n";
-        $dailyCount = $this->republisher->getDailyCount();
-        $maxRepub = min(70 - $dailyCount, count($candidates));
-        echo "  Today limit: " . (70 - $dailyCount) . ", candidates: " . count($candidates) . "\n";
-
-        $republished = 0;
-        foreach (array_slice($candidates, 0, $maxRepub) as $candidate) {
-            $newId = $this->republisher->republish($candidate);
-            if ($newId) {
-                $republished++;
-            }
-        }
-
-        echo "\n  Republished: {$republished}\n";
-        echo "  Used today: " . ($dailyCount + $republished) . "/70\n";
+        // 5. Итог — републикация НЕ выполняется автоматически!
+        //    Для републикации используйте: php index.php republish-all <count>
+        echo "\n  --- Итог ---\n";
+        echo "  Кандидатов добавлено: " . $candidateResult['added'] . "\n";
+        echo "  Для републикации: php index.php republish-all <count>\n";
+        echo "  (например: php index.php republish-all 20)\n";
 
         echo "\n" . str_repeat('=', 60) . "\n";
         echo "  Done\n";
         echo str_repeat('=', 60) . "\n";
+        flush();
+    }
+
+    /**
+     * Запуск только генерации фида (без SYNC с Avito)
+     *
+     * Команда: php index.php feed-only
+     *
+     * 1. Получает active ads из БД
+     * 2. Импортирует AutoLoad CSV
+     * 3. Считает дневной лимит републикации
+     * 4. Берёт максимум N кандидатов (по лимиту)
+     * 5. Генерирует фид
+     * 6. Удаляет включённых кандидатов из БД
+     */
+    public function runFeedOnly(): void
+    {
+        echo str_repeat('=', 60) . "\n";
+        echo "  Feed Generator (без SYNC)\n";
+        echo str_repeat('=', 60) . "\n";
+        flush();
+
+        // 1. Получаем active ads из БД
+        echo "\n  --- Active Ads из БД ---\n";
+        flush();
+        $active = $this->repository->getActive();
+        echo "  Active ads в БД: " . count($active) . "\n";
+
+        if (empty($active)) {
+            echo "  Нет активных объявлений -- exit\n";
+            return;
+        }
+
+        // 2. Импорт AutoLoad CSV
+        echo "\n  --- Import AutoLoad Feed ---\n";
+        flush();
+        $feedPath = $this->config['feed']['autoload_source'] ?? '';
+        
+        if ($feedPath && file_exists($feedPath)) {
+            echo "  Файл найден: {$feedPath}\n";
+            $imported = $this->importAutoloadFeed($feedPath);
+            echo "  Импортировано: {$imported} объявлений\n";
+        } else {
+            echo "  AutoLoad CSV не найден: {$feedPath}\n";
+        }
+
+        // 3. Считаем дневной лимит
+        $maxDailyRepub = (int) ($this->config['avito']['max_daily_repub'] ?? 70);
+        $dailyCount = $this->republisher->getDailyCount();
+        $remaining = $maxDailyRepub - $dailyCount;
+        
+        echo "\n  --- Лимит републикации ---\n";
+        echo "  Максимум в день: {$maxDailyRepub}\n";
+        echo "  Уже сегодня: {$dailyCount}\n";
+        echo "  Осталось: {$remaining}\n";
+
+        if ($remaining <= 0) {
+            echo "  [SKIP] Дневной лимит исчерпан\n";
+            echo "\n" . str_repeat('=', 60) . "\n";
+            echo "  Done (лимит исчерпан)\n";
+            echo str_repeat('=', 60) . "\n";
+            return;
+        }
+
+        // 4. Собираем кандидатов
+        echo "\n  --- Find Candidates ---\n";
+        flush();
+        $candidateResult = $this->republisher->collectCandidates(4);
+        echo "  Найдено: {$candidateResult['found']}\n";
+        echo "  Добавлено: {$candidateResult['added']}\n";
+        echo "  Уже были: {$candidateResult['skipped']}\n";
+
+        // 5. Генерация фида с ограничением кандидатов
+        echo "\n  --- Generate Feed ---\n";
+        flush();
+        $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config, $remaining);
+        $feedResult = $feedGenerator->generate(false);
+        
+        if ($feedResult['count'] > 0) {
+            echo "  Фид: {$feedResult['file']} ({$feedResult['count']} объявлений, " . count($feedResult['headers']) . " столбцов)\n";
+        }
+
+        // 6. Удаляем включённых кандидатов из БД
+        if (!empty($feedResult['candidate_avito_ids'])) {
+            echo "\n  --- Удаление кандидатов из БД ---\n";
+            $feedGenerator->removeCandidatesFromDb($feedResult['candidate_avito_ids']);
+        }
+
+        echo "\n  --- Итог ---\n";
+        echo "  Кандидатов в фиде: " . count($feedResult['candidate_avito_ids'] ?? []) . " (лимит: {$remaining})\n";
+        echo "  Файл: {$feedResult['file']}\n";
+
+        echo "\n" . str_repeat('=', 60) . "\n";
+        echo "  Done\n";
+        echo str_repeat('=', 60) . "\n";
+        flush();
     }
 
     /**
@@ -128,7 +268,10 @@ class AvitoController
     public function getStats(string $dateFrom, string $dateTo): string
     {
         $active = $this->repository->getActive();
-        $itemIds = array_map(fn($ad) => (int) $ad['avito_id'], array_filter($active));
+        $itemIds = array_values(array_filter(
+            array_map(fn($ad) => (int) ($ad['avito_id'] ?? 0), $active),
+            fn($id) => $id > 0
+        ));
 
         if (empty($itemIds)) {
             return json_encode([
@@ -150,35 +293,143 @@ class AvitoController
      */
     public function republish(int $adId): string
     {
-        $ad = $this->repository->getByLogicalKey('');
-        $found = null;
-        foreach ($this->repository->getAll() as $a) {
-            if ((int) $a['id'] === $adId) {
-                $found = $a;
-                break;
-            }
-        }
+        $ad = $this->repository->getById($adId);
 
-        if (!$found) {
+        if (!$ad) {
             return json_encode([
                 'status' => 'error',
                 'message' => "Ad ID {$adId} not found",
             ]);
         }
 
-        $newId = $this->republisher->republish($found);
+        $result = $this->republisher->republish($ad);
 
-        if ($newId) {
+        if ($result['success']) {
             return json_encode([
                 'status' => 'success',
-                'new_physical_id' => $newId,
-            ]);
+                'avito_id' => $result['avito_id'],
+                'new_physical_id' => $result['new_id'],
+            ], JSON_UNESCAPED_UNICODE);
         }
 
         return json_encode([
             'status' => 'error',
-            'message' => 'Republish failed',
-        ]);
+            'message' => $result['message'],
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Массовая републикация кандидатов (CLI + HTTP)
+     *
+     * ВАЖНО: количество републикаций указывается ЯВНО пользователем.
+     * Автоматическая републикация запрещена.
+     *
+     * @param int $maxCount Количество для републикации
+     * @param bool $cli Режим CLI (true) или HTTP (false)
+     */
+    public function republishBatch(int $maxCount, bool $cli = true): mixed
+    {
+        if ($maxCount <= 0) {
+            if ($cli) {
+                echo "  [ERROR] Количество должно быть больше 0\n";
+            } else {
+                return json_encode([
+                    'status' => 'error',
+                    'message' => 'Количество должно быть больше 0',
+                ], JSON_UNESCAPED_UNICODE);
+            }
+            return null;
+        }
+
+        // Сначала собираем кандидатов в таблицу, потом читаем полные данные
+        $this->republisher->collectCandidates(4);
+        $candidates = $this->repository->findZeroViewCandidates(4);
+
+        if (empty($candidates)) {
+            if ($cli) {
+                echo "  Нет кандидатов для републикации\n";
+                return null;
+            } else {
+                return json_encode([
+                    'status' => 'success',
+                    'message' => 'Нет кандидатов для републикации',
+                    'republished' => 0,
+                ], JSON_UNESCAPED_UNICODE);
+            }
+            return null;
+        }
+
+        if ($cli) {
+            $this->republishBatchCli($candidates, $maxCount);
+        } else {
+            $this->republishBatchHttp($candidates, $maxCount);
+        }
+    }
+
+    /**
+     * Массовая републикация — CLI режим с подтверждением
+     */
+    private function republishBatchCli(array $candidates, int $maxCount): void
+    {
+        echo "\n";
+        echo str_repeat('=', 60) . "\n";
+        echo "  МАССОВАЯ РЕПУБЛИКАЦИЯ\n";
+        echo str_repeat('=', 60) . "\n";
+        echo "  Кандидатов найдено: " . count($candidates) . "\n";
+        echo "  Запрошено републикаций: {$maxCount}\n";
+        echo "  Лимит сегодня: " . $this->republisher->getDailyCount() . "/" . ($this->config['avito']['max_daily_repub'] ?? 70) . "\n";
+        echo str_repeat('=', 60) . "\n\n";
+
+        // Показываем первые 5 кандидатов
+        echo "  Первые 5 кандидатов:\n";
+        foreach (array_slice($candidates, 0, 5) as $i => $ad) {
+            $avitoId = $ad['avito_id'] ?? 'N/A';
+            $masterData = $ad['master_data'] ? json_decode($ad['master_data'], true) : [];
+            $title = $masterData['title'] ?? '';
+            echo "    " . ($i + 1) . ". avito_id={$avitoId} | {$title}\n";
+        }
+        if (count($candidates) > 5) {
+            echo "    ... и ещё " . (count($candidates) - 5) . "\n";
+        }
+
+        // Запрашиваем подтверждение
+        echo "\n  Подтвердите републикацию {$maxCount} объявлений? (yes/no): ";
+        $handle = fopen('php://stdin', 'r');
+        $confirmation = trim(fgets($handle));
+        fclose($handle);
+
+        if (strtolower($confirmation) !== 'yes') {
+            echo "  [CANCEL] Республикация отменена пользователем\n";
+            return;
+        }
+
+        // Выполняем републикацию
+        $result = $this->republisher->republishBatch($candidates, $maxCount);
+
+        if ($result['republished'] > 0 && $result['failed'] === 0) {
+            echo "\n  [OK] Республикация завершена успешно\n";
+        } elseif ($result['republished'] > 0 && $result['failed'] > 0) {
+            echo "\n  [WARN] Республикация завершена с ошибками\n";
+        } else {
+            echo "\n  [SKIP] Республикация не выполнена\n";
+        }
+    }
+
+    /**
+     * Массовая републикация — HTTP режим (без подтверждения, сразу выполняет)
+     */
+    private function republishBatchHttp(array $candidates, int $maxCount): string
+    {
+        $result = $this->republisher->republishBatch($candidates, $maxCount);
+
+        return json_encode([
+            'status' => $result['failed'] > 0 ? 'partial_success' : 'success',
+            'total_candidates' => $result['total_candidates'],
+            'requested' => $result['requested'],
+            'republished' => $result['republished'],
+            'skipped' => $result['skipped'],
+            'failed' => $result['failed'],
+        ], JSON_UNESCAPED_UNICODE);
     }
 
     /**
@@ -487,7 +738,7 @@ class AvitoController
     public function generateFeed(bool $priorityMode = true): string
     {
         try {
-            $feedGenerator = new FeedGeneratorService($this->repository, $this->config);
+            $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config);
             $result = $feedGenerator->generate($priorityMode);
 
             return json_encode([
@@ -523,7 +774,7 @@ class AvitoController
     public function getFeedInfo(): string
     {
         try {
-            $feedGenerator = new FeedGeneratorService($this->repository, $this->config);
+            $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config);
             $info = $feedGenerator->getLastGeneration();
 
             return json_encode([
@@ -536,5 +787,220 @@ class AvitoController
                 'message' => $e->getMessage(),
             ], JSON_UNESCAPED_UNICODE);
         }
+    }
+
+    /**
+     * Сгенерировать фид для переопубликования (CLI + HTTP)
+     *
+     * HTTP: POST /republish-feeds с телом {"count": 10}
+     * CLI:  php index.php republish-feeds <count>
+     *
+     * Формат: ОДИН фид с mixed operations (remove + update)
+     *
+     * @param int|null $count Количество кандидатов для включения (до 70), null для HTTP
+     * @param bool $cli Режим CLI (true) или HTTP (false)
+     */
+    public function generateRepublishFeeds(?int $count = null, bool $cli = true): mixed
+    {
+        // Для HTTP режима читаем count из тела запроса
+        if (!$cli && $count === null) {
+            $input = json_decode(file_get_contents('php://input'), true);
+            $count = (int) ($input['count'] ?? 0);
+        }
+
+        if ($count <= 0) {
+            if ($cli) {
+                echo "  [ERROR] Количество должно быть больше 0\n";
+            } else {
+                return json_encode([
+                    'status' => 'error',
+                    'message' => 'Количество должно быть больше 0',
+                ], JSON_UNESCAPED_UNICODE);
+            }
+            return null;
+        }
+
+        // Получаем кандидатов
+        $feedService = new RepublishFeedService($this->repository, $this->apiClient, $this->config);
+        $candidates = $feedService->getCandidates();
+
+        if (empty($candidates)) {
+            if ($cli) {
+                echo "  Нет кандидатов для переопубликования\n";
+                echo "  Сначала выполните: php index.php collect-candidates\n";
+                return null;
+            } else {
+                return json_encode([
+                    'status' => 'success',
+                    'message' => 'Нет кандидатов для переопубликования',
+                    'feed_file' => '',
+                    'count' => 0,
+                ], JSON_UNESCAPED_UNICODE);
+            }
+        }
+
+        // Проверка лимита
+        $maxCount = min($count, 70);
+        if ($maxCount > count($candidates)) {
+            $maxCount = count($candidates);
+        }
+
+        if ($cli) {
+            echo "\n";
+            echo str_repeat('=', 60) . "\n";
+            echo "  ГЕНЕРАЦИЯ ФИДА ДЛЯ РЕПУБЛИКАЦИИ\n";
+            echo "  (ОДИН фид с mixed operations: remove + update)\n";
+            echo str_repeat('=', 60) . "\n";
+            echo "  Всего кандидатов:  " . count($candidates) . "\n";
+            echo "  Включим в фид:     {$maxCount}\n";
+            echo str_repeat('=', 60) . "\n\n";
+
+            // Показываем первых 5 кандидатов
+            echo "  Первые 5 кандидатов:\n";
+            foreach (array_slice($candidates, 0, 5) as $i => $c) {
+                $ad = $this->repository->getById((int) $c['physical_ad_id']);
+                $title = '';
+                if ($ad !== null && !empty($ad['master_data'])) {
+                    $masterData = json_decode($ad['master_data'], true);
+                    $title = $masterData['title'] ?? '';
+                }
+                $uniqueId = $ad['unique_id'] ?? 'N/A';
+                echo "    " . ($i + 1) . ". avito_id=" . ($c['avito_id'] ?? 'N/A')
+                    . " | unique_id={$uniqueId} | ID: {$c['physical_ad_id']} | {$title}\n";
+            }
+            if (count($candidates) > 5) {
+                echo "    ... и ещё " . (count($candidates) - 5) . "\n";
+            }
+
+            // Выполняем генерацию
+            $result = $feedService->generate($candidates, $maxCount);
+
+            if (!empty($result['feed_file'])) {
+                echo "\n  [OK] Фид сгенерирован успешно\n";
+                echo "\n  Следующие шаги:\n";
+                echo "    1. Проверить файл в директории fid/\n";
+                echo "    2. Загрузить фид на облако Avito\n";
+                echo "    3. Отправить команду Avito на обновление\n";
+            } else {
+                echo "\n  [ERROR] Не удалось сгенерировать фид\n";
+            }
+
+            return null;
+        }
+
+        // HTTP режим
+        $result = $feedService->generate($candidates, $maxCount);
+
+        return json_encode([
+            'status' => 'success',
+            'feed_file' => $result['feed_file'] ?? '',
+            'count' => $result['count'] ?? 0,
+            'candidates' => array_map(function ($ad) {
+                $masterData = json_decode($ad['master_data'] ?? '', true);
+                return [
+                    'physical_ad_id' => (int) ($ad['id'] ?? 0),
+                    'avito_id' => (string) ($ad['avito_id'] ?? ''),
+                    'unique_id' => (string) ($ad['unique_id'] ?? ''),
+                    'title' => $masterData['title'] ?? '',
+                ];
+            }, $result['candidates'] ?? []),
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Импорт данных из AutoLoad CSV файла Avito
+     *
+     * Заполняет колонки БД: unique_id, phone, description, images, brand, oem_number, title, location, price
+     *
+     * @return int Количество обновлённых записей
+     */
+    private function importAutoloadFeed(string $filePath): int
+    {
+        $raw = file_get_contents($filePath);
+        if ($raw === false) {
+            return 0;
+        }
+
+        // Убираем BOM
+        if (substr($raw, 0, 3) === "\xEF\xBB\xBF") {
+            $raw = substr($raw, 3);
+        }
+
+        $lines = explode("\n", $raw);
+        $lines = array_map('rtrim', $lines);
+        $lines = array_values(array_filter($lines, fn($l) => trim($l) !== ''));
+
+        if (count($lines) < 8) {
+            return 0;
+        }
+
+        // Строка 2 — заголовки
+        $headers = str_getcsv($lines[1], ';');
+
+        // Строки 8+ — данные
+        $dataLines = array_slice($lines, 7);
+
+        // Маппинг
+        $headerMap = [];
+        foreach ($headers as $i => $h) {
+            $headerMap[trim($h)] = $i;
+        }
+
+        $stmt = $this->pdo->prepare("
+            UPDATE physical_ads SET 
+                unique_id = :unique_id,
+                phone = :phone,
+                description = :description,
+                images = :images,
+                brand = :brand,
+                oem_number = :oem_number,
+                title = :title,
+                location = :location,
+                price = :price
+            WHERE avito_id = :avito_id
+        ");
+
+        $updated = 0;
+        foreach ($dataLines as $line) {
+            $row = str_getcsv($line, ';');
+
+            $avitoId = trim($row[$headerMap['Номер объявления на Авито']] ?? '');
+            if ($avitoId === '') continue;
+
+            // Ищем в БД
+            $existing = $this->pdo->prepare("SELECT id FROM physical_ads WHERE avito_id = :avito_id");
+            $existing->execute([':avito_id' => $avitoId]);
+            $dbRow = $existing->fetch(PDO::FETCH_ASSOC);
+
+            if ($dbRow === false) continue;
+
+            $uniqueId = trim($row[$headerMap['Уникальный идентификатор объявления']] ?? '');
+            $phone = trim($row[$headerMap['Номер телефона']] ?? '');
+            $description = strip_tags(trim($row[$headerMap['Описание объявления']] ?? ''));
+            $imagesRaw = trim($row[$headerMap['Ссылки на фото']] ?? '');
+            $images = $imagesRaw !== '' ? json_encode(explode('|', $imagesRaw), JSON_UNESCAPED_UNICODE) : '';
+            $brand = trim($row[$headerMap['Производитель']] ?? '');
+            $oem = trim($row[$headerMap['Номер детали OEM']] ?? '');
+            $title = trim($row[$headerMap['Название объявления']] ?? '');
+            $address = trim($row[$headerMap['Адрес']] ?? '');
+            $price = (int) ($row[$headerMap['Цена']] ?? 0);
+
+            $stmt->execute([
+                ':unique_id' => $uniqueId,
+                ':phone' => $phone,
+                ':description' => $description,
+                ':images' => $images,
+                ':brand' => $brand,
+                ':oem_number' => $oem,
+                ':title' => $title,
+                ':location' => $address,
+                ':price' => $price,
+                ':avito_id' => $avitoId,
+            ]);
+
+            $updated++;
+        }
+
+        return $updated;
     }
 }

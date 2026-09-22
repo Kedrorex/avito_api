@@ -38,6 +38,8 @@ return [
         ],
         // Пауза между пакетными запросами статистики
         'stats_request_delay_seconds' => 8,
+        // Таймаут HTTP-запросов к Avito API (секунды)
+        'request_timeout' => 120,
 
         // Republisher settings
         'max_daily_repub'   => 70,
@@ -77,12 +79,19 @@ return [
         'category'         => 'Транспорт - Запчасти и аксессуары - Запчасти - Для автомобилей - Двигатель',
 
         // Значения по умолчанию для обязательных полей
-        'default_views'         => '',           // Способ размещения
-        'default_ad_type'       => '',           // Вид объявления
-        'default_product_type'  => '',           // Тип товара
-        'default_part_type'     => '',           // Вид запчасти
-        'default_engine_type'   => '',           // Тип детали двигателя
-        'default_condition'     => 'new',        // Состояние: new / used / restored
+        'default_views'         => 'Package',          // Способ размещения
+        'default_ad_type'       => '',                 // Вид объявления
+        'default_product_type'  => '',                 // Тип товара
+        'default_part_type'     => '',                 // Вид запчасти
+        'default_engine_type'   => '',                 // Тип детали двигателя
+        'default_condition'     => 'new',              // Состояние: new / used / restored
+
+        // Контактные данные компании
+        'company_name'          => '',                 // Название компании
+        'email'                 => '',                 // Почта
+
+        // Источник данных для AutoLoad (импорт из CSV)
+        'autoload_source'       => __DIR__ . '/../fid/Основная база.csv',
     ],
 
     // SQLite database
@@ -92,6 +101,8 @@ return [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
+            // SQLite: ждать до 10 сек при блокировке (1001 = PDO::SQLITE_ATTR_BUSY_TIMEOUT, PHP 8.1+)
+            1001 => 10000,
         ],
     ],
 ];
