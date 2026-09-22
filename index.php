@@ -248,6 +248,14 @@ if ($cli) {
                     . " rules=" . implode(',', $analysisResult['matched_rules']) . "\n";
             }
             break;
+        case 'sync-unique-ids':
+            $all = in_array('--all', $argv, true);
+            $controller->syncUniqueIds($all);
+            break;
+        case 'import-feed':
+            $feedPath = $argv[2] ?? null;
+            $controller->importFeedFromFile(is_string($feedPath) ? $feedPath : null);
+            break;
         case 'migrate-unique-id':
             // Миграция: заполняет unique_id из master_data для существующих объявлений
             echo "\n  Миграция unique_id для существующих объявлений...\n";
@@ -273,7 +281,7 @@ if ($cli) {
             break;
         default:
             echo "Unknown command: {$command}\n";
-            echo "Available: run, feed-only, sync, active, status-counts, republish, republish-all, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, republish-feeds, analyze, analyze-report, migrate-unique-id\n";
+            echo "Available: run, feed-only, sync, active, status-counts, republish, republish-all, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, republish-feeds, analyze, analyze-report, sync-unique-ids, import-feed, migrate-unique-id\n";
             exit(1);
     }
 } else {
