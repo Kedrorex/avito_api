@@ -44,6 +44,11 @@ if ($cli) {
     $argv = $_SERVER['argv'] ?? [];
     $command = $argv[1] ?? 'run';
 
+    $dataDir = __DIR__ . '/data';
+    if (!is_dir($dataDir)) {
+        mkdir($dataDir, 0755, true);
+    }
+
     // Создаём зависимости
     $pdo = new PDO(
         $config['database']['dsn'],
@@ -52,7 +57,14 @@ if ($cli) {
         $config['database']['options']
     );
 
-    $apiClient = new \App\Services\AvitoAPIClient($config['avito']);
+    try {
+        $apiClient = new \App\Services\AvitoAPIClient($config['avito']);
+    } catch (\RuntimeException $e) {
+        echo "  [ERROR] " . $e->getMessage() . "\n";
+        echo "  Создайте .env в корне проекта с AVITO_CLIENT_ID, AVITO_CLIENT_SECRET и AVITO_USER_ID.\n";
+        exit(1);
+    }
+
     $repository = new \App\Repositories\ItemRepository($pdo);
     $republisher = new \App\Services\RepublisherService($apiClient, $repository, $config['avito']);
     $controller = new \App\Controllers\AvitoController(
@@ -248,6 +260,14 @@ if ($cli) {
                     . " rules=" . implode(',', $analysisResult['matched_rules']) . "\n";
             }
             break;
+        case 'sync-unique-ids':
+            $all = in_array('--all', $argv, true);
+            $controller->syncUniqueIds($all);
+            break;
+        case 'import-feed':
+            $feedPath = $argv[2] ?? null;
+            $controller->importFeedFromFile(is_string($feedPath) ? $feedPath : null);
+            break;
         case 'migrate-unique-id':
             // Миграция: заполняет unique_id из master_data для существующих объявлений
             echo "\n  Миграция unique_id для существующих объявлений...\n";
@@ -273,7 +293,7 @@ if ($cli) {
             break;
         default:
             echo "Unknown command: {$command}\n";
-            echo "Available: run, feed-only, sync, active, status-counts, republish, republish-all, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, republish-feeds, analyze, analyze-report, migrate-unique-id\n";
+            echo "Available: run, feed-only, sync, active, status-counts, republish, republish-all, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, republish-feeds, analyze, analyze-report, sync-unique-ids, import-feed, migrate-unique-id\n";
             exit(1);
     }
 } else {

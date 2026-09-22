@@ -11,7 +11,7 @@ use Psr\Http\Message\ResponseInterface;
 /**
  * HTTP client for Avito API authenticated by avito/oauth2-avito.
  */
-final class AvitoAPIClient
+final class AvitoAPIClient implements AutoloadIdProvider
 {
     private Avito $provider;
     private ?AccessTokenInterface $accessToken = null;
@@ -282,6 +282,55 @@ final class AvitoAPIClient
         } catch (\Throwable $e) {
             return null;
         }
+    }
+
+    /**
+     * Идентификаторы объявлений из файла автозагрузки по номерам на Авито.
+     *
+     * GET /autoload/v2/items/ad_ids
+     *
+     * @param list<int|string> $avitoIds
+     * @return list<array{avito_id: string, ad_id: ?string}>
+     */
+    public function getAdIdsByAvitoIds(array $avitoIds): array
+    {
+        $ids = [];
+        foreach ($avitoIds as $avitoId) {
+            $avitoId = trim((string) $avitoId);
+            if ($avitoId !== '' && ctype_digit($avitoId)) {
+                $ids[$avitoId] = $avitoId;
+            }
+        }
+        $ids = array_values($ids);
+        if ($ids === []) {
+            return [];
+        }
+
+        $response = $this->requestJson('GET', '/autoload/v2/items/ad_ids', [
+            'query' => implode(',', $ids),
+        ]);
+
+        $mapped = [];
+        foreach ($response['items'] ?? [] as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $avitoId = trim((string) ($item['avito_id'] ?? ''));
+            if ($avitoId === '') {
+                continue;
+            }
+            $adId = $item['ad_id'] ?? null;
+            $adId = $adId === null ? null : trim((string) $adId);
+            if ($adId === '') {
+                $adId = null;
+            }
+            $mapped[] = [
+                'avito_id' => $avitoId,
+                'ad_id' => $adId,
+            ];
+        }
+
+        return $mapped;
     }
 
     /**
