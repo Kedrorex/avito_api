@@ -44,6 +44,11 @@ if ($cli) {
     $argv = $_SERVER['argv'] ?? [];
     $command = $argv[1] ?? 'run';
 
+    $dataDir = __DIR__ . '/data';
+    if (!is_dir($dataDir)) {
+        mkdir($dataDir, 0755, true);
+    }
+
     // Создаём зависимости
     $pdo = new PDO(
         $config['database']['dsn'],
