@@ -11,11 +11,11 @@ use App\Repositories\ItemRepository;
  */
 class AutoloadIdSyncService
 {
-    private AvitoAPIClient $apiClient;
+    private AutoloadIdProvider $apiClient;
     private ItemRepository $repository;
     private array $config;
 
-    public function __construct(AvitoAPIClient $apiClient, ItemRepository $repository, array $config)
+    public function __construct(AutoloadIdProvider $apiClient, ItemRepository $repository, array $config)
     {
         $this->apiClient = $apiClient;
         $this->repository = $repository;

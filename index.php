@@ -44,6 +44,11 @@ if ($cli) {
     $argv = $_SERVER['argv'] ?? [];
     $command = $argv[1] ?? 'run';
 
+    $dataDir = __DIR__ . '/data';
+    if (!is_dir($dataDir)) {
+        mkdir($dataDir, 0755, true);
+    }
+
     // Создаём зависимости
     $pdo = new PDO(
         $config['database']['dsn'],
@@ -52,7 +57,14 @@ if ($cli) {
         $config['database']['options']
     );
 
-    $apiClient = new \App\Services\AvitoAPIClient($config['avito']);
+    try {
+        $apiClient = new \App\Services\AvitoAPIClient($config['avito']);
+    } catch (\RuntimeException $e) {
+        echo "  [ERROR] " . $e->getMessage() . "\n";
+        echo "  Создайте .env в корне проекта с AVITO_CLIENT_ID, AVITO_CLIENT_SECRET и AVITO_USER_ID.\n";
+        exit(1);
+    }
+
     $repository = new \App\Repositories\ItemRepository($pdo);
     $republisher = new \App\Services\RepublisherService($apiClient, $repository, $config['avito']);
     $controller = new \App\Controllers\AvitoController(

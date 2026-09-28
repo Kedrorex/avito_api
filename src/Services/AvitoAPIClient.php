@@ -11,7 +11,7 @@ use Psr\Http\Message\ResponseInterface;
 /**
  * HTTP client for Avito API authenticated by avito/oauth2-avito.
  */
-final class AvitoAPIClient
+final class AvitoAPIClient implements AutoloadIdProvider
 {
     private Avito $provider;
     private ?AccessTokenInterface $accessToken = null;

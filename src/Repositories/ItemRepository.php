@@ -934,6 +934,9 @@ class ItemRepository
         }
 
         if ($existing !== null) {
+            if ($uniqueId === '' && !empty($existing['unique_id'])) {
+                $masterData['unique_id'] = $existing['unique_id'];
+            }
             // Не перезаписываем unique_id из основного API, если он уже заполнен
             // из Автозагрузки (AutoloadIdSyncService).
             // Основной API (/core/v1/items) возвращает свой uniqueId — это другое поле.
@@ -1555,6 +1558,70 @@ class ItemRepository
         }
 
         return $result;
+    }
+
+    /**
+     * Номера Авито, для которых нужно запросить Id из автозагрузки.
+     *
+     * @return list<string>
+     */
+    public function listAvitoIdsForUniqueSync(bool $all): array
+    {
+        if ($all) {
+            $sql = "SELECT avito_id FROM physical_ads
+                    WHERE avito_id IS NOT NULL AND avito_id != ''
+                      AND status IN ('active', 'low_perf')
+                    ORDER BY id";
+        } else {
+            $sql = "SELECT avito_id FROM physical_ads
+                    WHERE avito_id IS NOT NULL AND avito_id != ''
+                      AND status IN ('active', 'low_perf')
+                      AND (unique_id IS NULL OR unique_id = '' OR unique_id = avito_id)
+                    ORDER BY id";
+        }
+
+        $ids = $this->pdo->query($sql)->fetchAll(PDO::FETCH_COLUMN);
+
+        return array_values(array_map('strval', $ids));
+    }
+
+    /**
+     * Записать Id из файла автозагрузки.
+     *
+     * @param array<string, string> $pairs avito_id => ad_id
+     */
+    public function applyAutoloadIds(array $pairs): int
+    {
+        $stmt = $this->pdo->prepare(
+            "UPDATE physical_ads
+             SET unique_id = :unique_id
+             WHERE avito_id = :avito_id
+               AND (unique_id IS NULL OR unique_id != :unique_id_cmp)"
+        );
+
+        $updated = 0;
+        $this->beginTransaction();
+        try {
+            foreach ($pairs as $avitoId => $adId) {
+                $avitoId = trim((string) $avitoId);
+                $adId = trim($adId);
+                if ($avitoId === '' || $adId === '') {
+                    continue;
+                }
+                $stmt->execute([
+                    ':unique_id' => $adId,
+                    ':unique_id_cmp' => $adId,
+                    ':avito_id' => $avitoId,
+                ]);
+                $updated += $stmt->rowCount();
+            }
+            $this->commit();
+        } catch (\Throwable $e) {
+            $this->rollBack();
+            throw $e;
+        }
+
+        return $updated;
     }
 
     /**
