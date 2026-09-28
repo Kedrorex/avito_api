@@ -50,6 +50,10 @@ return [
         // Candidates settings (zero-view detection)
         'candidate_days'      => 4,    // дней для анализа
         'candidate_threshold' => 0,    // порог просмотров (0)
+
+        // Автозагрузка: пакетный запрос Id объявления из файла
+        'autoload_id_batch_size' => 100,
+        'autoload_request_delay_seconds' => 1,
     ],
 
     // Анализ и пороги для кандидатов на переопубликовку

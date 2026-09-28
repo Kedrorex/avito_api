@@ -4,6 +4,7 @@ namespace App\Controllers;
 
 use App\Repositories\ItemRepository;
 use App\Services\AnalysisService;
+use App\Services\AutoloadIdSyncService;
 use App\Services\AvitoAPIClient;
 use App\Services\FeedGeneratorService;
 use App\Services\RepublishFeedService;
@@ -70,37 +71,7 @@ class AvitoController
             return;
         }
 
-        $hasNewAds = $syncResult['created'] > 0;
-
-        // 2. Импорт данных из AutoLoad CSV (только если появились новые объявления)
-        if ($hasNewAds) {
-            echo "\n  --- Import AutoLoad Feed ---\n";
-            flush();
-            $feedPath = $this->config['feed']['autoload_source'] ?? __DIR__ . '/../../fid/Рабочий образец.csv';
-            
-            if (file_exists($feedPath)) {
-                echo "  Файл найден: {$feedPath}\n";
-                echo "  Появились новые объявления. Импортировать данные из AutoLoad CSV?\n";
-                echo "  [y/N] ";
-                
-                $handle = fopen('php://stdin', 'r');
-                $response = trim(fgets($handle)) ?? '';
-                fclose($handle);
-                
-                if (strtolower($response) === 'y') {
-                    $imported = $this->importAutoloadFeed($feedPath);
-                    echo "  Импортировано: {$imported} объявлений\n";
-                } else {
-                    echo "  Импорт пропущен\n";
-                }
-            } else {
-                echo "  AutoLoad CSV не найден: {$feedPath}\n";
-                echo "  Скачайте фид из Avito (Настройки → Автовыгрузка → Скачать фид)\n";
-                echo "  и положите в: {$feedPath}\n";
-            }
-        } else {
-            echo "\n  Новых объявлений нет — импорт AutoLoad CSV пропускается\n";
-        }
+        $this->syncUniqueIds(false);
 
         // 2. Сбор статистики
         echo "\n  --- Collect Stats ---\n";
@@ -144,7 +115,7 @@ class AvitoController
      * Команда: php index.php feed-only
      *
      * 1. Получает active ads из БД
-     * 2. Импортирует AutoLoad CSV
+     * 2. Добирает unique_id из API Автозагрузки
      * 3. Считает дневной лимит републикации
      * 4. Берёт максимум N кандидатов (по лимиту)
      * 5. Генерирует фид
@@ -168,18 +139,7 @@ class AvitoController
             return;
         }
 
-        // 2. Импорт AutoLoad CSV
-        echo "\n  --- Import AutoLoad Feed ---\n";
-        flush();
-        $feedPath = $this->config['feed']['autoload_source'] ?? '';
-        
-        if ($feedPath && file_exists($feedPath)) {
-            echo "  Файл найден: {$feedPath}\n";
-            $imported = $this->importAutoloadFeed($feedPath);
-            echo "  Импортировано: {$imported} объявлений\n";
-        } else {
-            echo "  AutoLoad CSV не найден: {$feedPath}\n";
-        }
+        $this->syncUniqueIds(false);
 
         // 3. Считаем дневной лимит
         $maxDailyRepub = (int) ($this->config['avito']['max_daily_repub'] ?? 70);
@@ -905,6 +865,35 @@ class AvitoController
                 ];
             }, $result['candidates'] ?? []),
         ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Запросить unique_id в API Автозагрузки и записать в БД.
+     *
+     * @param bool $all true — все active и low_perf, false — только пустые и равные номеру Авито
+     */
+    public function syncUniqueIds(bool $all = false): void
+    {
+        echo "\n  --- Sync AutoLoad IDs ---\n";
+        flush();
+        $sync = new AutoloadIdSyncService($this->apiClient, $this->repository, $this->config['avito']);
+        $sync->sync($all);
+    }
+
+    /**
+     * Ручной импорт CSV из кабинета. В run() больше не вызывается.
+     */
+    public function importFeedFromFile(?string $path = null): void
+    {
+        $feedPath = $path ?? (string) ($this->config['feed']['autoload_source'] ?? '');
+        echo "\n  --- Import AutoLoad Feed ---\n";
+        if ($feedPath === '' || !file_exists($feedPath)) {
+            echo "  Файл не найден: {$feedPath}\n";
+            return;
+        }
+        echo "  Файл: {$feedPath}\n";
+        $imported = $this->importAutoloadFeed($feedPath);
+        echo "  Импортировано: {$imported} объявлений\n";
     }
 
     /**

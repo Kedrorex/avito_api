@@ -763,22 +763,31 @@ class ItemRepository
         }
 
         if ($existing !== null) {
-            $this->updatePhysical((int) $existing['id'], [
+            if ($uniqueId === '' && !empty($existing['unique_id'])) {
+                $masterData['unique_id'] = $existing['unique_id'];
+            }
+
+            $update = [
                 'status' => $status,
                 'published_at' => $existing['published_at'] ?: $publishedAt,
                 'master_data' => $masterData,
-                'unique_id' => $uniqueId,
-                'phone' => $phone,
-                'contact_method' => $contactMethod,
-                'brand' => $brand,
-                'oem_number' => $oemNumber,
-                'images' => $imagesJson,
-                'title' => (string) ($item['title'] ?? ''),
-                'description' => $description,
-                'location' => (string) $location,
-                'price' => $price ?? 0,
-                'category_params' => $categoryParamsJson,
-            ]);
+            ];
+            $this->putIfFilled($update, 'unique_id', $uniqueId);
+            $this->putIfFilled($update, 'phone', $phone);
+            $this->putIfFilled($update, 'contact_method', $contactMethod);
+            $this->putIfFilled($update, 'brand', $brand);
+            $this->putIfFilled($update, 'oem_number', $oemNumber);
+            $this->putIfFilled($update, 'images', $imagesJson);
+            $this->putIfFilled($update, 'title', (string) ($item['title'] ?? ''));
+            $this->putIfFilled($update, 'description', $description);
+            $locationText = is_scalar($location) || $location === null ? (string) ($location ?? '') : '';
+            $this->putIfFilled($update, 'location', $locationText);
+            if ($price !== null && $price > 0) {
+                $update['price'] = $price;
+            }
+            $this->putIfFilled($update, 'category_params', $categoryParamsJson);
+
+            $this->updatePhysical((int) $existing['id'], $update);
             return false;
         }
 
@@ -1203,6 +1212,70 @@ class ItemRepository
     }
 
     /**
+     * Номера Авито, для которых нужно запросить Id из автозагрузки.
+     *
+     * @return list<string>
+     */
+    public function listAvitoIdsForUniqueSync(bool $all): array
+    {
+        if ($all) {
+            $sql = "SELECT avito_id FROM physical_ads
+                    WHERE avito_id IS NOT NULL AND avito_id != ''
+                      AND status IN ('active', 'low_perf')
+                    ORDER BY id";
+        } else {
+            $sql = "SELECT avito_id FROM physical_ads
+                    WHERE avito_id IS NOT NULL AND avito_id != ''
+                      AND status IN ('active', 'low_perf')
+                      AND (unique_id IS NULL OR unique_id = '' OR unique_id = avito_id)
+                    ORDER BY id";
+        }
+
+        $ids = $this->pdo->query($sql)->fetchAll(PDO::FETCH_COLUMN);
+
+        return array_values(array_map('strval', $ids));
+    }
+
+    /**
+     * Записать Id из файла автозагрузки.
+     *
+     * @param array<string, string> $pairs avito_id => ad_id
+     */
+    public function applyAutoloadIds(array $pairs): int
+    {
+        $stmt = $this->pdo->prepare(
+            "UPDATE physical_ads
+             SET unique_id = :unique_id
+             WHERE avito_id = :avito_id
+               AND (unique_id IS NULL OR unique_id != :unique_id_cmp)"
+        );
+
+        $updated = 0;
+        $this->beginTransaction();
+        try {
+            foreach ($pairs as $avitoId => $adId) {
+                $avitoId = trim((string) $avitoId);
+                $adId = trim($adId);
+                if ($avitoId === '' || $adId === '') {
+                    continue;
+                }
+                $stmt->execute([
+                    ':unique_id' => $adId,
+                    ':unique_id_cmp' => $adId,
+                    ':avito_id' => $avitoId,
+                ]);
+                $updated += $stmt->rowCount();
+            }
+            $this->commit();
+        } catch (\Throwable $e) {
+            $this->rollBack();
+            throw $e;
+        }
+
+        return $updated;
+    }
+
+    /**
      * Получить дневной счётчик републикаций
      */
     public function getDailyRepubCount(string $today): int
@@ -1449,6 +1522,16 @@ class ItemRepository
         $stmt = $this->pdo->prepare("SELECT COUNT(*) FROM {$partitionName}");
         $stmt->execute();
         return (int) $stmt->fetchColumn();
+    }
+
+    /**
+     * @param array<string, mixed> $update
+     */
+    private function putIfFilled(array &$update, string $key, string $value): void
+    {
+        if ($value !== '') {
+            $update[$key] = $value;
+        }
     }
 
     /**
