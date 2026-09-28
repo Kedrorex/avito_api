@@ -22,19 +22,18 @@ return [
 
         // Pagination defaults
         'per_page'      => 50,
-        'max_per_page'  => 100,
+        'max_per_page'  => 99,
 
         // Retry settings
         'max_retries'       => 3,
         'retry_delay_base'  => 65, // секунды для ConnectionResetError
 
-        // Stats
+        // Поля POST /stats/v1/accounts/{user_id}/items.
+        // Телефон и чаты этот метод не отдаёт: их нет в enum.
         'stats_fields' => [
             'views', 'uniqViews',
             'contacts', 'uniqContacts',
             'favorites', 'uniqFavorites',
-            'contactsShowPhone',
-            'contactsMessenger',
         ],
         // Пауза между пакетными запросами статистики
         'stats_request_delay_seconds' => 8,
@@ -50,6 +49,10 @@ return [
         // Candidates settings (zero-view detection)
         'candidate_days'      => 4,    // дней для анализа
         'candidate_threshold' => 0,    // порог просмотров (0)
+
+        // Автозагрузка: пакетный запрос Id объявления из файла
+        'autoload_id_batch_size' => 100,
+        'autoload_request_delay_seconds' => 1,
     ],
 
     // Анализ и пороги для кандидатов на переопубликовку
@@ -72,7 +75,7 @@ return [
 
     // Feed settings (Avito AutoLoad)
     'feed' => [
-        // Каталог для выгрузки TSV файлов
+        // Каталог для XML и CSV фидов
         'output_dir'       => __DIR__ . '/../fid',
 
         // Категория фида (соответствует шаблону Avito)

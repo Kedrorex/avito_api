@@ -194,14 +194,12 @@ foreach ($batches as $batchNumber => $batch) {
             }
 
             if (!isset($statsByItemId[(string) $itemId]) || $statsByItemId[(string) $itemId] === []) {
-                // Сохраняем пустую статистику — это нормально для новых объявлений
-                $repo->saveStats((int) $ad['id'], [], $price);
-                $batchSaved++;
                 continue;
             }
-            $repo->saveStats((int) $ad['id'], $statsByItemId[(string) $itemId], $price);
+            $dailyStats = $statsByItemId[(string) $itemId];
+            $repo->saveStats((int) $ad['id'], $dailyStats, $price);
             $batchSaved++;
-            $totalStatsRecords += count($statsByItemId[(string) $itemId]);
+            $totalStatsRecords += count($dailyStats);
         }
         $pdo->commit();
         $savedItems += $batchSaved;

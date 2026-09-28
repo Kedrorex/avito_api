@@ -44,6 +44,7 @@ class RepublisherService
 
         $dateTo = date('Y-m-d', strtotime('-1 day'));
         $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
+        echo "  Период: {$dateFrom} — {$dateTo}\n";
 
         // Делим на пачки по 200
         for ($i = 0; $i < count($active); $i += 200) {
@@ -80,7 +81,7 @@ class RepublisherService
             // Сохраняем статистику в БД с транзакцией и обработкой ошибок
             $savedCount = 0;
             $failedCount = 0;
-            $this->repository->beginTransaction();
+            $this->repository->beginWriteTransaction();
             try {
                 foreach ($batch as $ad) {
                     $avitoId = (string) ($ad['avito_id'] ?? '');
@@ -88,8 +89,13 @@ class RepublisherService
                         continue;
                     }
 
+                    $itemStats = $statsByItem[$avitoId];
+                    if ($itemStats === []) {
+                        continue;
+                    }
+
                     try {
-                        $this->repository->saveStats((int) $ad['id'], $statsByItem[$avitoId]);
+                        $this->repository->saveStats((int) $ad['id'], $itemStats);
                         $savedCount++;
                     } catch (\Throwable $e) {
                         $failedCount++;
@@ -114,7 +120,7 @@ class RepublisherService
     /**
      * Получить из Avito объявления всех поддержанных статусов и сохранить дневную статистику.
      *
-     * @return array{items:int, created:int, batches:int, saved_items:int, failed_batches:int, date_from:string, date_to:string}
+     * @return array{items:int, created:int, updated:int, removed:int, batches:int, saved_items:int, failed_batches:int, date_from:string, date_to:string}
      */
     public function collectAllActiveStats(int $days = 30): array
     {
@@ -128,13 +134,13 @@ class RepublisherService
         echo "  Loading advertisement list...\n";
         $items = $this->apiClient->getAllItems(
             $statuses,
-            200,
+            99,
             static function (int $page, int $loaded, int $total): void {
                 $totalLabel = $total > 0 ? (string) $total : '?';
                 echo "  List page {$page}: {$loaded}/{$totalLabel} ads loaded\n";
             }
         );
-        $created = $this->repository->syncFromApi($items);
+        $sync = $this->repository->syncFromApi($items);
         $dateTo = date('Y-m-d', strtotime('-1 day'));
         $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
         $delaySeconds = (int) ($this->config['stats_request_delay_seconds'] ?? 8);
@@ -160,19 +166,27 @@ class RepublisherService
                 $statsByItemId = [];
                 foreach ($statsList as $statItem) {
                     $itemId = (string) ($statItem['itemId'] ?? '');
-                    if ($itemId !== '') {
-                        $statsByItemId[$itemId] = $statItem['stats'] ?? [];
+                    if ($itemId === '') {
+                        continue;
                     }
+                    $statsByItemId[$itemId] = array_merge(
+                        $statsByItemId[$itemId] ?? [],
+                        $statItem['stats'] ?? []
+                    );
                 }
 
-                $this->repository->beginTransaction();
+                $this->repository->beginWriteTransaction();
                 try {
                     foreach ($itemIds as $itemId) {
                         $ad = $this->repository->getByAvitoId((string) $itemId);
                         if ($ad === null || !isset($statsByItemId[(string) $itemId])) {
                             continue;
                         }
-                        $this->repository->saveStats((int) $ad['id'], $statsByItemId[(string) $itemId]);
+                        $dailyStats = $statsByItemId[(string) $itemId];
+                        if ($dailyStats === []) {
+                            continue;
+                        }
+                        $this->repository->saveStats((int) $ad['id'], $dailyStats);
                         $savedItems++;
                     }
                     $this->repository->commit();
@@ -195,7 +209,9 @@ class RepublisherService
 
         return [
             'items' => count($items),
-            'created' => $created,
+            'created' => (int) ($sync['created'] ?? 0),
+            'updated' => (int) ($sync['updated'] ?? 0),
+            'removed' => (int) ($sync['removed'] ?? 0),
             'batches' => count($batches),
             'saved_items' => $savedItems,
             'failed_batches' => $failedBatches,
@@ -441,8 +457,6 @@ class RepublisherService
             $inserted = $this->repository->addCandidate($physicalAdId, $avitoId, $logicalKey);
 
             if ($inserted) {
-                // Обновляем статус на low_perf
-                $this->repository->updatePhysical($physicalAdId, ['status' => 'low_perf']);
                 $added++;
             } else {
                 $skipped++;
