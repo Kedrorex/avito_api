@@ -6,13 +6,19 @@ use App\Repositories\ItemRepository;
 use App\Services\AvitoAPIClient;
 
 /**
- * Генератор фида для Avito AutoLoad (CSV)
+ * Генератор фида для Avito AutoLoad
  *
- * Формат: CSV UTF-8 (разделитель ,)
+ * Файл фида: XML formatVersion=3 (`fid/avito_feed_YYYY-MM-DD.xml`).
  * Категория: Транспорт - Запчасти и аксессуары - Запчасти - Для автомобилей - Двигатель
  *
- * 26 столбцов по эталону: fid/Рабочий образец.csv
- * Данные читаются из колонок БД physical_ads
+ * Данные читаются из колонок БД physical_ads.
+ *
+ * Состав файла:
+ * 1. Сверху — сегодняшняя порция очереди republish_candidates_* (не больше
+ *    max_daily_repub, по умолчанию 70), AvitoStatus=removed.
+ * 2. Ниже — весь текущий каталог (active и low_perf), включая тех же
+ *    кандидатов, AvitoStatus=active.
+ * Кандидаты, не попавшие в порцию, остаются в очереди на следующие дни.
  */
 class FeedGeneratorService
 {
@@ -36,83 +42,510 @@ class FeedGeneratorService
     }
 
     /**
-     * Сгенерировать CSV файл с объявлениями
+     * Сгенерировать XML-фид.
      *
      * @param bool $priorityMode Если true — кандидаты на переопубликовку идут первыми
+     * @param bool $keepQueue Тестовый фид: порция снятия пишется, но очередь и дневной счётчик не меняются
+     * @param int $forcedRemoval Тест: столько первых объявлений каталога в блок снятия, без очереди и без сверки avito_id
      *
-     * @return array{file: string, count: int, headers: string[]}
+     * @return array{file: string, xml_file: string, csv_file: string, count: int, headers: string[]}
      */
-    public function generate(bool $priorityMode = true): array
+    public function generate(bool $priorityMode = true, bool $keepQueue = false, int $forcedRemoval = 0): array
     {
-        $activeAds = $this->repository->getActive();
-
-        if (empty($activeAds)) {
-            echo "  Нет активных объявлений для выгрузки\n";
-            return ['file' => '', 'count' => 0, 'headers' => []];
+        $restored = $this->repository->restoreLowPerfStatus();
+        if ($restored > 0) {
+            echo "  В каталог возвращено из low_perf: {$restored}\n";
         }
 
-        $date = date('Y-m-d');
-        $filename = "avito_feed_{$date}.csv";
-        $filepath = $this->outputDir . '/' . $filename;
+        $catalog = $this->repository->getFeedCatalog();
+
+        if ($catalog === []) {
+            echo "  Нет объявлений для выгрузки\n";
+            return [
+                'file' => '',
+                'xml_file' => '',
+                'csv_file' => '',
+                'count' => 0,
+                'headers' => [],
+                'candidate_avito_ids' => [],
+                'removal_ads' => [],
+                'catalog_count' => 0,
+            ];
+        }
+
+        $catalogByAvitoId = [];
+        foreach ($catalog as $ad) {
+            $avitoId = (string) ($ad['avito_id'] ?? '');
+            if ($avitoId !== '') {
+                $catalogByAvitoId[$avitoId] = $ad;
+            }
+        }
+
+        if ($forcedRemoval > 0) {
+            $removalAds = array_slice(array_values($catalog), 0, $forcedRemoval);
+            echo "  Тест: на снятие первые " . count($removalAds) . " из каталога, без очереди и без сверки avito_id\n";
+            foreach ($removalAds as $ad) {
+                echo "    id=" . ($ad['id'] ?? '')
+                    . " avito_id=" . ($ad['avito_id'] ?? '')
+                    . " unique_id=" . ($ad['unique_id'] ?? '') . "\n";
+            }
+        } else {
+            $removalAds = $this->selectRemovalBatch($catalogByAvitoId, $keepQueue);
+        }
+
+        $ads = [];
+        $candidateAvitoIds = [];
+        foreach ($removalAds as $ad) {
+            $data = $this->buildAdData($ad, 'removed');
+            if ($data === null) {
+                continue;
+            }
+            $ads[] = $data;
+            $candidateAvitoIds[] = (string) ($ad['avito_id'] ?? '');
+        }
+
+        $catalogCount = 0;
+        foreach ($catalog as $ad) {
+            $data = $this->buildAdData($ad, 'active');
+            if ($data === null) {
+                continue;
+            }
+            $ads[] = $data;
+            $catalogCount++;
+        }
 
         if (!is_dir($this->outputDir)) {
             mkdir($this->outputDir, 0755, true);
         }
 
+        $date = date('Y-m-d');
+        $xmlPath = $this->outputDir . "/avito_feed_{$date}.xml";
         $headers = $this->getHeaders();
 
-        $handle = fopen($filepath, 'w', false);
-        if ($handle === false) {
-            throw new \RuntimeException("Не удалось создать файл фида: {$filepath}");
+        $this->writeXml($xmlPath, $ads);
+
+        if ($keepQueue) {
+            echo "  Очередь не изменена: кандидаты остались в таблице, дневной счётчик не увеличен\n";
+        } else {
+            $this->consumeRemovalBatch($removalAds);
         }
 
-        // UTF-8 BOM
-        fwrite($handle, "\xEF\xBB\xBF");
-
-        fputcsv($handle, $headers, ',');
-
-        // 1. Сначала кандидаты (AvitoStatus=removed — деактивация)
-        $candidates = $this->getCandidates();
-        
-        // Ограничиваем количество кандидатов по лимиту
-        if ($this->maxCandidates > 0 && count($candidates) > $this->maxCandidates) {
-            $candidates = array_slice($candidates, 0, $this->maxCandidates);
-        }
-        
-        $candidateAvitoIds = [];
-        $count = 0;
-        foreach ($candidates as $candidate) {
-            $row = $this->buildRow($candidate, 'removed');
-            if ($row !== null) {
-                fputcsv($handle, $row, ',');
-                $count++;
-                $candidateAvitoIds[] = (string) ($candidate['avito_id'] ?? '');
-            }
-        }
-
-        // 2. Потом все active (AvitoStatus=active — активация/обновление)
-        foreach ($activeAds as $ad) {
-            // Пропускаем кандидатов — они уже добавлены выше
-            if (in_array((string) ($ad['avito_id'] ?? ''), $candidateAvitoIds, true)) {
-                continue;
-            }
-            $row = $this->buildRow($ad, 'active');
-            if ($row !== null) {
-                fputcsv($handle, $row, ',');
-                $count++;
-            }
-        }
-
-        fclose($handle);
-
-        echo "  Файл создан: {$filepath} ({$count} строк: " . count($candidates) . " remove + " . ($count - count($candidates)) . " active)\n";
+        $count = count($ads);
+        echo "  XML: {$xmlPath}\n";
+        echo "  Снятие сверху: " . count($candidateAvitoIds) . "\n";
+        echo "  Каталог ниже:  {$catalogCount} (те же объявления, кандидаты внутри)\n";
+        echo "  Объявлений:    {$count}\n";
 
         return [
-            'file' => $filepath,
+            'file' => $xmlPath,
+            'xml_file' => $xmlPath,
+            'csv_file' => '',
             'count' => $count,
             'headers' => $headers,
             'candidate_avito_ids' => $candidateAvitoIds,
+            'removal_ads' => $removalAds,
+            'catalog_count' => $catalogCount,
         ];
+    }
+
+    /**
+     * Фид, в котором остаются только первые $keep объявлений каталога.
+     * В файле их нет — Авито снимет с публикации. Очередь и дневной счётчик не меняются.
+     *
+     * @return array{file: string, xml_file: string, csv_file: string, count: int, headers: string[], kept: int, catalog_total: int}
+     */
+    public function generateKeep(int $keep = 10): array
+    {
+        $empty = [
+            'file' => '',
+            'xml_file' => '',
+            'csv_file' => '',
+            'count' => 0,
+            'headers' => [],
+            'candidate_avito_ids' => [],
+            'removal_ads' => [],
+            'catalog_count' => 0,
+            'kept' => 0,
+            'catalog_total' => 0,
+        ];
+
+        if ($keep < 1) {
+            $keep = 10;
+        }
+
+        $catalog = $this->repository->getFeedCatalog();
+        if ($catalog === []) {
+            echo "  Нет объявлений для выгрузки\n";
+            return $empty;
+        }
+
+        $keptAds = array_slice(array_values($catalog), 0, $keep);
+        $ads = [];
+        foreach ($keptAds as $ad) {
+            $data = $this->buildAdData($ad, 'active');
+            if ($data === null) {
+                continue;
+            }
+            $ads[] = $data;
+        }
+
+        if ($ads === []) {
+            echo "  Не удалось собрать объявления, которые нужно оставить\n";
+            return $empty;
+        }
+
+        if (!is_dir($this->outputDir)) {
+            mkdir($this->outputDir, 0755, true);
+        }
+
+        $date = date('Y-m-d');
+        $xmlPath = $this->outputDir . "/avito_feed_keep_{$date}.xml";
+        $this->writeXml($xmlPath, $ads);
+
+        $catalogTotal = count($catalog);
+        $removed = $catalogTotal - count($ads);
+        echo "  XML: {$xmlPath}\n";
+        echo "  В файле остаются: " . count($ads) . "\n";
+        echo "  Каталог всего:    {$catalogTotal}\n";
+        echo "  Снимутся, потому что их нет в файле: {$removed}\n";
+        foreach ($ads as $ad) {
+            echo "    оставить avito_id=" . ($ad['avito_id'] ?? '')
+                . " unique_id=" . ($ad['unique_id'] ?? '') . "\n";
+        }
+        echo "  Очередь и дневной счётчик не изменены.\n";
+        echo "  Внимание: загрузка этого файла снимет все объявления аккаунта, которых в нём нет.\n";
+
+        return [
+            'file' => $xmlPath,
+            'xml_file' => $xmlPath,
+            'csv_file' => '',
+            'count' => count($ads),
+            'headers' => $this->getHeaders(),
+            'candidate_avito_ids' => [],
+            'removal_ads' => [],
+            'catalog_count' => count($ads),
+            'kept' => count($ads),
+            'catalog_total' => $catalogTotal,
+        ];
+    }
+
+    /**
+     * Фид из кабинета Avito: неактивные (removed, old) + текущие active.
+     * Все строки пишутся как AvitoStatus=active. Очередь републикации не трогаем.
+     *
+     * @return array{file: string, xml_file: string, csv_file: string, count: int, headers: string[], inactive_count: int, active_count: int}
+     */
+    public function generateFromCabinet(int $inactiveLimit = 0, bool $includeActive = true): array
+    {
+        $empty = [
+            'file' => '',
+            'xml_file' => '',
+            'csv_file' => '',
+            'count' => 0,
+            'headers' => [],
+            'candidate_avito_ids' => [],
+            'removal_ads' => [],
+            'catalog_count' => 0,
+            'inactive_count' => 0,
+            'active_count' => 0,
+            'status_counts' => [],
+        ];
+
+        echo "  Кабинет: неактивные removed, old\n";
+        flush();
+        $inactive = $this->apiClient->getAllItems(
+            ['removed', 'old'],
+            99,
+            static function (int $page, int $fetched, int $total): void {
+                echo "    Неактивные: страница {$page}, уже {$fetched}" . ($total > 0 ? " из {$total}" : '') . "\n";
+                flush();
+            }
+        );
+
+        $statusCounts = [];
+        foreach ($inactive as $item) {
+            $status = (string) ($item['status'] ?? 'unknown');
+            $statusCounts[$status] = ($statusCounts[$status] ?? 0) + 1;
+        }
+        foreach ($statusCounts as $status => $count) {
+            echo "    {$status}: {$count}\n";
+        }
+        echo "    Неактивных всего: " . count($inactive) . "\n";
+
+        if ($inactiveLimit > 0 && count($inactive) > $inactiveLimit) {
+            $inactive = array_slice($inactive, 0, $inactiveLimit);
+            echo "    Берём в фид неактивных: {$inactiveLimit}\n";
+        }
+
+        $active = [];
+        if ($includeActive) {
+            echo "  Кабинет: active\n";
+            flush();
+            $active = $this->apiClient->getAllItems(
+                ['active'],
+                99,
+                static function (int $page, int $fetched, int $total): void {
+                    echo "    Активные: страница {$page}, уже {$fetched}" . ($total > 0 ? " из {$total}" : '') . "\n";
+                    flush();
+                }
+            );
+            echo "    Активных всего: " . count($active) . "\n";
+        }
+
+        $byAvitoId = [];
+        foreach (array_merge($inactive, $active) as $item) {
+            $avitoId = trim((string) ($item['id'] ?? ''));
+            if ($avitoId === '') {
+                continue;
+            }
+            $byAvitoId[$avitoId] = $item;
+        }
+
+        if ($byAvitoId === []) {
+            echo "  В кабинете нет объявлений для выгрузки\n";
+            return $empty;
+        }
+
+        $adIdMap = $this->resolveAutoloadIds(array_keys($byAvitoId));
+
+        $ads = [];
+        foreach ($byAvitoId as $item) {
+            $hydrated = $this->hydrateApiItem($item, $adIdMap);
+            $hydrated['_fallback_description'] = false;
+            $data = $this->buildAdData($hydrated, 'active');
+            if ($data === null) {
+                continue;
+            }
+            $ads[] = $data;
+        }
+
+        if ($ads === []) {
+            echo "  Не удалось собрать ни одного объявления\n";
+            return $empty;
+        }
+
+        if (!is_dir($this->outputDir)) {
+            mkdir($this->outputDir, 0755, true);
+        }
+
+        $date = date('Y-m-d');
+        $xmlPath = $this->outputDir . "/avito_feed_inactive_{$date}.xml";
+        $headers = $this->getHeaders();
+
+        $this->writeXml($xmlPath, $ads);
+
+        $count = count($ads);
+        echo "  XML: {$xmlPath}\n";
+        echo "  AvitoStatus:   active\n";
+        echo "  Неактивных:    " . count($inactive) . "\n";
+        echo "  Активных:      " . count($active) . "\n";
+        echo "  В файле:       {$count}\n";
+        echo "  Внимание: если загрузить только этот файл, Авито снимет всё, чего в нём нет.\n";
+
+        return [
+            'file' => $xmlPath,
+            'xml_file' => $xmlPath,
+            'csv_file' => '',
+            'count' => $count,
+            'headers' => $headers,
+            'candidate_avito_ids' => [],
+            'removal_ads' => [],
+            'catalog_count' => $count,
+            'inactive_count' => count($inactive),
+            'active_count' => count($active),
+            'status_counts' => $statusCounts,
+        ];
+    }
+
+    /**
+     * @param list<string> $avitoIds
+     * @return array<string, string>
+     */
+    private function resolveAutoloadIds(array $avitoIds): array
+    {
+        $batchSize = max(1, min(100, (int) ($this->config['avito']['autoload_id_batch_size'] ?? 100)));
+        $delay = max(0, (int) ($this->config['avito']['autoload_request_delay_seconds'] ?? 1));
+        $map = [];
+        $chunks = array_chunk($avitoIds, $batchSize);
+        echo "  Autoload Id: " . count($avitoIds) . " номеров, пакетов " . count($chunks) . "\n";
+        flush();
+
+        foreach ($chunks as $index => $chunk) {
+            echo "    Пакет " . ($index + 1) . "/" . count($chunks) . "\n";
+            flush();
+            try {
+                foreach ($this->apiClient->getAdIdsByAvitoIds($chunk) as $item) {
+                    $avitoId = (string) ($item['avito_id'] ?? '');
+                    $adId = (string) ($item['ad_id'] ?? '');
+                    if ($avitoId !== '' && $adId !== '') {
+                        $map[$avitoId] = $adId;
+                    }
+                }
+            } catch (\Throwable $e) {
+                echo "    [WARN] ad_ids: " . $e->getMessage() . "\n";
+            }
+            if ($delay > 0 && $index < count($chunks) - 1) {
+                sleep($delay);
+            }
+        }
+
+        echo "    Нашли Id автозагрузки: " . count($map) . "\n";
+        return $map;
+    }
+
+    /**
+     * @param array<string, mixed> $item
+     * @param array<string, string> $adIdMap
+     * @return array<string, mixed>
+     */
+    private function hydrateApiItem(array $item, array $adIdMap): array
+    {
+        $avitoId = trim((string) ($item['id'] ?? ''));
+        $price = $item['price'] ?? 0;
+        if (is_array($price)) {
+            $price = (int) ($price['amount'] ?? 0);
+        }
+
+        $location = $this->scalarLocation($item['address'] ?? $item['location'] ?? '');
+        $category = $item['category'] ?? [];
+        $images = $item['images'] ?? [];
+
+        return [
+            'id' => $avitoId,
+            'avito_id' => $avitoId,
+            'unique_id' => $adIdMap[$avitoId] ?? (string) ($item['uniqueId'] ?? ''),
+            'title' => (string) ($item['title'] ?? ''),
+            'price' => (int) $price,
+            'location' => $location,
+            'description' => (string) ($item['description'] ?? ''),
+            'phone' => '',
+            'contact_method' => '',
+            'brand' => '',
+            'oem_number' => '',
+            'images' => json_encode($this->normalizeImageList($images), JSON_UNESCAPED_UNICODE),
+            'category' => is_array($category) ? $category : ['name' => (string) $category],
+            'category_params' => '',
+            'status' => 'active',
+        ];
+    }
+
+    private function scalarLocation(mixed $location): string
+    {
+        if (is_string($location)) {
+            return $location;
+        }
+        if (!is_array($location)) {
+            return '';
+        }
+        foreach (['address', 'name', 'title'] as $key) {
+            if (!empty($location[$key]) && is_string($location[$key])) {
+                return $location[$key];
+            }
+        }
+        return '';
+    }
+
+    /**
+     * @param mixed $images
+     * @return list<string>
+     */
+    private function normalizeImageList(mixed $images): array
+    {
+        if (!is_array($images)) {
+            return [];
+        }
+        $urls = [];
+        foreach ($images as $img) {
+            if (is_string($img) && $img !== '') {
+                $urls[] = $img;
+            } elseif (is_array($img)) {
+                $url = $img['url'] ?? $img['thumb_url'] ?? '';
+                if ($url !== '') {
+                    $urls[] = $url;
+                }
+            }
+        }
+        return $urls;
+    }
+
+    /**
+     * Следующие кандидаты из очереди, не больше дневного лимита.
+     * В каталоге они остаются и пишутся второй раз как активные.
+     *
+     * @param array<string, array<string, mixed>> $catalogByAvitoId
+     * @param bool $ignoreDailyUsage Для тестового фида: взять полную порцию, даже если лимит дня уже занят
+     * @return list<array<string, mixed>>
+     */
+    private function selectRemovalBatch(array $catalogByAvitoId, bool $ignoreDailyUsage = false): array
+    {
+        $maxDaily = (int) ($this->config['avito']['max_daily_repub'] ?? 70);
+        if ($maxDaily < 1) {
+            $maxDaily = 70;
+        }
+        $used = $this->repository->getDailyRepubCount(date('Y-m-d'));
+        $slots = $ignoreDailyUsage ? $maxDaily : max(0, $maxDaily - $used);
+        if ($this->maxCandidates > 0) {
+            $slots = min($slots, $this->maxCandidates);
+        }
+
+        if ($ignoreDailyUsage) {
+            echo "  Тестовый фид: снятие до {$slots}, уже использовано сегодня {$used} — в файл не входит и не списывается\n";
+        } else {
+            echo "  Лимит снятий сегодня: {$slots} из {$maxDaily} (уже использовано: {$used})\n";
+        }
+        if ($slots === 0) {
+            echo "  Очередь сегодня не берём, в файле только каталог\n";
+            return [];
+        }
+
+        $queue = $this->getCandidates();
+        usort($queue, static function (array $a, array $b): int {
+            $byTime = strcmp((string) ($a['added_at'] ?? ''), (string) ($b['added_at'] ?? ''));
+            if ($byTime !== 0) {
+                return $byTime;
+            }
+            return ((int) ($a['id'] ?? 0)) <=> ((int) ($b['id'] ?? 0));
+        });
+
+        $batch = [];
+        $seen = [];
+        foreach ($queue as $candidate) {
+            if (count($batch) >= $slots) {
+                break;
+            }
+            $avitoId = (string) ($candidate['avito_id'] ?? '');
+            if ($avitoId === '' || isset($seen[$avitoId]) || !isset($catalogByAvitoId[$avitoId])) {
+                continue;
+            }
+            $seen[$avitoId] = true;
+            $batch[] = $catalogByAvitoId[$avitoId];
+        }
+
+        echo "  Из очереди взято: " . count($batch) . " из " . count($queue) . "\n";
+
+        return $batch;
+    }
+
+    /**
+     * Порция, попавшая в блок снятия, списывается с дневного лимита и уходит из очереди.
+     *
+     * @param list<array<string, mixed>> $removalAds
+     */
+    private function consumeRemovalBatch(array $removalAds): void
+    {
+        if ($removalAds === []) {
+            return;
+        }
+
+        $today = date('Y-m-d');
+        $already = (int) ($this->repository->getMeta('feed_repub_' . $today) ?? '0');
+        $this->repository->setMeta('feed_repub_' . $today, (string) ($already + count($removalAds)));
+
+        foreach ($removalAds as $ad) {
+            $this->repository->removeCandidate((int) ($ad['id'] ?? 0));
+        }
+
+        echo "  Из очереди снято после фида: " . count($removalAds) . "\n";
     }
 
     /**
@@ -182,47 +615,32 @@ class FeedGeneratorService
     }
 
     /**
-     * Сформировать строку CSV для одного объявления
-     * Данные читаются из колонок БД
+     * Поля одного объявления для XML и CSV.
      *
-     * @param array $ad Данные объявления
-     * @param string $avitoStatus Явный статус Avito ('active'/'removed') — если пустой, определяется автоматически
+     * @param array<string, mixed> $ad
+     * @return array<string, mixed>|null
      */
-    private function buildRow(array $ad, string $avitoStatus = ''): ?array
+    private function buildAdData(array $ad, string $avitoStatus = ''): ?array
     {
-        // 1. Уникальный идентификатор
         $uniqueId = $ad['unique_id'] ?? '';
         if ($uniqueId === '') {
             $uniqueId = $ad['avito_id'] ?? "ad_{$ad['id']}";
         }
 
-        // 2. Способ размещения
-        $placementMethod = $this->config['feed']['default_views'] ?? 'Package';
-
-        // 3. Номер объявления на Авито
-        $avitoNumber = (string) ($ad['avito_id'] ?? '');
-
-        // 4. Номер телефона — из колонки БД
         $phone = (string) ($ad['phone'] ?? '');
         $phone = preg_replace('/[^0-9]/', '', $phone);
         if ($phone !== '' && !str_starts_with($phone, '7')) {
             $phone = '7' . $phone;
         }
 
-        // 5. Адрес — из колонки БД
         $address = (string) ($ad['location'] ?? '');
-
-        // 6. Способ связи — из колонки БД
         $contactMethod = (string) ($ad['contact_method'] ?? '');
 
-        // 7. Категория
         $category = $ad['category'] ?? [];
-        $categoryName = is_array($category) ? ($category['name'] ?? '') : '';
+        $categoryName = is_array($category) ? (string) ($category['name'] ?? '') : '';
 
-        // 8. Описание — из колонки БД
         $description = (string) ($ad['description'] ?? '');
-        if ($description === '') {
-            // Fallback: собираем из title + location
+        if ($description === '' && ($ad['_fallback_description'] ?? true)) {
             $title = (string) ($ad['title'] ?? '');
             $parts = [$title];
             if ($address !== '') {
@@ -231,84 +649,197 @@ class FeedGeneratorService
             $description = implode("\n", $parts);
         }
 
-        // 9. Ссылки на фото — из колонки БД (JSON array)
         $images = $this->parseImages($ad);
-
-        // 10. Название объявления — из колонки БД
         $title = (string) ($ad['title'] ?? '');
-
-        // 11. Цена — из колонки БД
         $price = (int) ($ad['price'] ?? 0);
 
-        // 12-17. Категорийные параметры — из колонки БД (JSON)
         $catParams = $this->parseCategoryParams($ad);
-        $productType = $catParams['Вид товара'] ?? '';
-        $partType = $catParams['Вид запчасти'] ?? '';
-        $engineType = $catParams['Тип детали двигателя'] ?? '';
-        $condition = $catParams['Состояние'] ?? ($this->config['feed']['default_condition'] ?? 'new');
+        $goodsType = (string) ($catParams['Вид товара'] ?? '');
+        $productType = (string) ($catParams['Тип товара'] ?? '');
+        $partType = (string) ($catParams['Вид запчасти'] ?? '');
+        $engineType = (string) ($catParams['Тип детали двигателя'] ?? '');
+        $condition = (string) ($catParams['Состояние'] ?? ($this->config['feed']['default_condition'] ?? 'new'));
 
-        // Дефолты если пустые
-        if ($productType === '') $productType = $this->config['feed']['default_product_type'] ?? '';
-        if ($partType === '') $partType = $this->config['feed']['default_part_type'] ?? '';
-        if ($engineType === '') $engineType = $this->config['feed']['default_engine_type'] ?? '';
+        if ($goodsType === '') {
+            $goodsType = (string) ($this->config['feed']['default_product_type'] ?? '');
+        }
+        if ($productType === '') {
+            $productType = $goodsType;
+        }
+        if ($partType === '') {
+            $partType = (string) ($this->config['feed']['default_part_type'] ?? '');
+        }
+        if ($engineType === '') {
+            $engineType = (string) ($this->config['feed']['default_engine_type'] ?? '');
+        }
 
-        // 18. Происхождение
-        $origin = $catParams['Происхождение'] ?? '';
-
-        // 19. Доступность
-        $availability = $catParams['Доступность'] ?? '';
-
-        // 20. Производитель — из колонки БД
-        $brand = (string) ($ad['brand'] ?? '');
-
-        // 21. Номер детали OEM — из колонки БД
-        $oem = (string) ($ad['oem_number'] ?? '');
-
-        // 22. TypeID
-        $typeId = $catParams['TypeID'] ?? '';
-
-        // 23. AvitoDateEnd
-        $avitoDateEnd = $this->generateAvitoDateEnd();
-
-        // 24. AvitoStatus — если передан явно, используем его, иначе определяем автоматически
         if ($avitoStatus === '') {
             $avitoStatus = $this->getAvitoStatus($ad);
         }
 
-        // 25. Название компании
-        $companyName = $this->config['feed']['company_name'] ?? '';
+        return [
+            'unique_id' => (string) $uniqueId,
+            'listing_fee' => (string) ($this->config['feed']['default_views'] ?? 'Package'),
+            'avito_id' => (string) ($ad['avito_id'] ?? ''),
+            'phone' => $phone,
+            'address' => $address,
+            'contact_method' => $contactMethod,
+            'category' => $categoryName !== '' ? $categoryName : 'Запчасти и аксессуары',
+            'description' => $description,
+            'images' => $images,
+            'title' => $title,
+            'price' => $price,
+            'goods_type' => $goodsType,
+            'ad_type' => (string) ($this->config['feed']['default_ad_type'] ?? ''),
+            'product_type' => $productType,
+            'spare_part_type' => $partType,
+            'engine_type' => $engineType,
+            'condition' => $condition,
+            'origin' => (string) ($catParams['Происхождение'] ?? ''),
+            'availability' => (string) ($catParams['Доступность'] ?? ''),
+            'brand' => (string) ($ad['brand'] ?? ''),
+            'oem' => (string) ($ad['oem_number'] ?? ''),
+            'type_id' => (string) ($catParams['TypeID'] ?? $catParams['TypeId'] ?? ''),
+            'date_end' => $this->generateAvitoDateEnd(),
+            'avito_status' => $avitoStatus,
+            'company_name' => (string) ($this->config['feed']['company_name'] ?? ''),
+            'email' => (string) ($this->config['feed']['email'] ?? ''),
+        ];
+    }
 
-        // 26. Почта
-        $email = $this->config['feed']['email'] ?? '';
+    /**
+     * XML Avito AutoLoad: <Ads formatVersion="3" target="Avito.ru">
+     *
+     * @param list<array<string, mixed>> $ads
+     */
+    private function writeXml(string $filepath, array $ads): void
+    {
+        if (!class_exists(\XMLWriter::class)) {
+            throw new \RuntimeException('Для XML-фида нужно расширение php-xmlwriter');
+        }
+
+        $xml = new \XMLWriter();
+        if (!$xml->openURI($filepath)) {
+            throw new \RuntimeException("Не удалось создать XML фид: {$filepath}");
+        }
+
+        $xml->setIndent(true);
+        $xml->setIndentString('  ');
+        $xml->startDocument('1.0', 'UTF-8');
+        $xml->startElement('Ads');
+        $xml->writeAttribute('formatVersion', '3');
+        $xml->writeAttribute('target', 'Avito.ru');
+
+        foreach ($ads as $ad) {
+            $this->writeXmlAd($xml, $ad);
+        }
+
+        $xml->endElement();
+        $xml->endDocument();
+        $xml->flush();
+    }
+
+    /**
+     * @param array<string, mixed> $ad
+     */
+    private function writeXmlAd(\XMLWriter $xml, array $ad): void
+    {
+        $defaults = $this->xmlCategoryDefaults();
+
+        $xml->startElement('Ad');
+        $this->writeXmlValue($xml, 'Id', (string) $ad['unique_id']);
+        $this->writeXmlValue($xml, 'ListingFee', (string) $ad['listing_fee']);
+        $this->writeXmlValue($xml, 'AvitoId', (string) $ad['avito_id']);
+        $this->writeXmlValue($xml, 'ContactPhone', (string) $ad['phone']);
+        $this->writeXmlValue($xml, 'Address', (string) $ad['address']);
+        $this->writeXmlValue($xml, 'ContactMethod', (string) $ad['contact_method']);
+        $this->writeXmlValue($xml, 'Category', (string) ($ad['category'] !== '' ? $ad['category'] : $defaults['category']));
+
+        if ((string) $ad['description'] !== '') {
+            $xml->startElement('Description');
+            $xml->writeCdata((string) $ad['description']);
+            $xml->endElement();
+        }
+
+        $images = array_slice($ad['images'], 0, 10);
+        if ($images !== []) {
+            $xml->startElement('Images');
+            foreach ($images as $url) {
+                $xml->startElement('Image');
+                $xml->writeAttribute('url', (string) $url);
+                $xml->endElement();
+            }
+            $xml->endElement();
+        }
+
+        $this->writeXmlValue($xml, 'Title', (string) $ad['title']);
+        $xml->writeElement('Price', (string) (int) $ad['price']);
+        $this->writeXmlValue($xml, 'GoodsType', (string) ($ad['goods_type'] !== '' ? $ad['goods_type'] : $defaults['goods_type']));
+        $this->writeXmlValue($xml, 'AdType', (string) $ad['ad_type']);
+        $this->writeXmlValue($xml, 'ProductType', (string) ($ad['product_type'] !== '' ? $ad['product_type'] : $defaults['product_type']));
+        $this->writeXmlValue($xml, 'SparePartType', (string) ($ad['spare_part_type'] !== '' ? $ad['spare_part_type'] : $defaults['spare_part_type']));
+        $this->writeXmlValue($xml, 'EngineSparePartType', (string) $ad['engine_type']);
+        $this->writeXmlValue($xml, 'Condition', $this->mapConditionForXml((string) $ad['condition']));
+        $this->writeXmlValue($xml, 'Originality', (string) $ad['origin']);
+        $this->writeXmlValue($xml, 'Availability', (string) $ad['availability']);
+        $this->writeXmlValue($xml, 'Brand', (string) $ad['brand']);
+        $this->writeXmlValue($xml, 'OEM', (string) $ad['oem']);
+        $this->writeXmlValue($xml, 'TypeId', (string) $ad['type_id']);
+        $this->writeXmlValue($xml, 'DateEnd', $this->toXmlDateEnd((string) $ad['date_end']));
+        $this->writeXmlValue($xml, 'AvitoStatus', (string) $ad['avito_status']);
+        $this->writeXmlValue($xml, 'ManagerName', (string) $ad['company_name']);
+        $xml->endElement();
+    }
+
+    private function writeXmlValue(\XMLWriter $xml, string $name, string $value): void
+    {
+        if ($value === '') {
+            return;
+        }
+        $xml->writeElement($name, $value);
+    }
+
+    /**
+     * @return array{category: string, goods_type: string, product_type: string, spare_part_type: string}
+     */
+    private function xmlCategoryDefaults(): array
+    {
+        $path = (string) ($this->config['feed']['category'] ?? '');
+        $parts = array_values(array_filter(array_map('trim', explode(' - ', $path)), static fn(string $part): bool => $part !== ''));
 
         return [
-            $uniqueId,                                    // 1. Уникальный идентификатор
-            $placementMethod,                             // 2. Способ размещения
-            $avitoNumber,                                 // 3. Номер объявления на Авито
-            $phone,                                       // 4. Номер телефона
-            $address,                                     // 5. Адрес
-            $contactMethod,                               // 6. Способ связи
-            $categoryName ?: 'Запчасти и аксессуары',    // 7. Категория
-            $description,                                 // 8. Описание объявления
-            implode('|', $images),                        // 9. Ссылки на фото
-            $title,                                       // 10. Название объявления
-            $price,                                       // 11. Цена
-            $productType,                                 // 12. Вид товара
-            $this->config['feed']['default_ad_type'] ?? '', // 13. Вид объявления
-            $productType,                                 // 14. Тип товара
-            $partType,                                    // 15. Вид запчасти
-            $engineType,                                  // 16. Тип детали двигателя
-            $condition,                                   // 17. Состояние
-            $origin,                                      // 18. Происхождение
-            $availability,                                // 19. Доступность
-            $brand,                                       // 20. Производитель
-            $oem,                                         // 21. Номер детали OEM
-            $typeId,                                      // 22. TypeID
-            $avitoDateEnd,                                // 23. AvitoDateEnd
-            $avitoStatus,                                 // 24. AvitoStatus
-            $companyName,                                 // 25. Название компании
-            $email,                                       // 26. Почта
+            'category' => $parts[1] ?? 'Запчасти и аксессуары',
+            'goods_type' => $parts[2] ?? 'Запчасти',
+            'product_type' => $parts[3] ?? 'Для автомобилей',
+            'spare_part_type' => $parts[4] ?? 'Двигатель',
         ];
+    }
+
+    private function mapConditionForXml(string $value): string
+    {
+        $normalized = mb_strtolower(trim($value));
+
+        return match ($normalized) {
+            'new', 'новое' => 'Новое',
+            'used', 'б/у', 'bu', 'б.у.', 'б.у' => 'Б/у',
+            default => $value,
+        };
+    }
+
+    /**
+     * CSV хранит AvitoDateEnd как dd.MM_yy, XML DateEnd — dd.MM.yyyy.
+     */
+    private function toXmlDateEnd(string $csvDateEnd): string
+    {
+        if (preg_match('/^(\d{2})\.(\d{2})_(\d{2,4})$/', $csvDateEnd, $matches) === 1) {
+            $year = $matches[3];
+            if (strlen($year) === 2) {
+                $year = '20' . $year;
+            }
+            return "{$matches[1]}.{$matches[2]}.{$year}";
+        }
+
+        return (new \DateTimeImmutable('+30 days'))->format('d.m.Y');
     }
 
     /**
@@ -415,17 +946,17 @@ class FeedGeneratorService
             return [];
         }
 
-        $files = glob($feedDir . '/avito_feed_*.csv');
-        if (empty($files)) {
+        $files = glob($feedDir . '/avito_feed_*.xml') ?: [];
+        if ($files === []) {
             return [];
         }
 
-        usort($files, function ($a, $b) {
+        usort($files, static function ($a, $b) {
             return strcmp(basename($b), basename($a));
         });
 
         $lastFile = $files[0];
-        $basename = basename($lastFile, '.csv');
+        $basename = basename($lastFile);
 
         if (preg_match('/avito_feed_(\d{4}-\d{2}-\d{2})/', $basename, $matches)) {
             $date = $matches[1];
@@ -433,7 +964,8 @@ class FeedGeneratorService
             $date = date('Y-m-d', filemtime($lastFile));
         }
 
-        $lineCount = count(file($lastFile)) - 1;
+        $contents = (string) file_get_contents($lastFile);
+        $lineCount = preg_match_all('/<Ad\b/', $contents);
 
         return [
             'last_file' => $lastFile,
@@ -485,5 +1017,125 @@ class FeedGeneratorService
             echo "  [DEBUG] Avito IDs в БД: " . implode(', ', array_slice($dbAvitoIds, 0, 5)) . "...\n";
             echo "  [DEBUG] Совпадений: 0 из " . count($avitoIds) . "\n";
         }
+    }
+
+    /**
+     * Перегнать существующий CSV-фид в XML того же состава.
+     */
+    public function convertCsvToXml(string $csvPath, ?string $xmlPath = null): string
+    {
+        $ads = $this->adsFromCsv($csvPath);
+
+        if ($xmlPath === null) {
+            $xmlPath = preg_replace('/\.csv$/i', '.xml', $csvPath) ?? ($csvPath . '.xml');
+        }
+
+        $this->writeXml($xmlPath, $ads);
+        echo "  XML из CSV: {$xmlPath} (" . count($ads) . " объявлений)\n";
+
+        return $xmlPath;
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function adsFromCsv(string $csvPath): array
+    {
+        if (!is_file($csvPath)) {
+            throw new \RuntimeException("CSV не найден: {$csvPath}");
+        }
+
+        $raw = file($csvPath, FILE_IGNORE_NEW_LINES);
+        if ($raw === false || $raw === []) {
+            throw new \RuntimeException("CSV пустой: {$csvPath}");
+        }
+
+        $raw[0] = preg_replace('/^\xEF\xBB\xBF/', '', $raw[0]) ?? $raw[0];
+        $headerIndex = null;
+        $ads = [];
+
+        foreach ($raw as $line) {
+            $row = $this->parseCsvLine($line);
+            if ($row === []) {
+                continue;
+            }
+
+            if ($headerIndex === null) {
+                $headerIndex = [];
+                foreach ($row as $i => $header) {
+                    $headerIndex[trim((string) $header)] = $i;
+                }
+                continue;
+            }
+
+            $get = static function (string $name) use ($row, $headerIndex): string {
+                $i = $headerIndex[$name] ?? null;
+                return $i === null ? '' : (string) ($row[$i] ?? '');
+            };
+
+            $uniqueId = $get('Уникальный идентификатор объявления');
+            if ($uniqueId === '') {
+                continue;
+            }
+
+            $imagesRaw = $get('Ссылки на фото');
+            $images = $imagesRaw === '' ? [] : array_values(array_filter(explode('|', $imagesRaw)));
+
+            $ads[] = [
+                'unique_id' => $uniqueId,
+                'listing_fee' => $get('Способ размещения'),
+                'avito_id' => $get('Номер объявления на Авито'),
+                'phone' => $get('Номер телефона'),
+                'address' => $get('Адрес'),
+                'contact_method' => $get('Способ связи'),
+                'category' => $get('Категория'),
+                'description' => $get('Описание объявления'),
+                'images' => $images,
+                'title' => $get('Название объявления'),
+                'price' => (int) $get('Цена'),
+                'goods_type' => $get('Вид товара'),
+                'ad_type' => $get('Вид объявления'),
+                'product_type' => $get('Тип товара'),
+                'spare_part_type' => $get('Вид запчасти'),
+                'engine_type' => $get('Тип детали двигателя'),
+                'condition' => $get('Состояние'),
+                'origin' => $get('Происхождение'),
+                'availability' => $get('Доступность'),
+                'brand' => $get('Производитель'),
+                'oem' => $get('Номер детали OEM'),
+                'type_id' => $get('TypeID'),
+                'date_end' => $get('AvitoDateEnd'),
+                'avito_status' => $get('AvitoStatus'),
+                'company_name' => $get('Название компании'),
+                'email' => $get('Почта'),
+            ];
+        }
+
+        return $ads;
+    }
+
+    /**
+     * Строка текущего CSV: целиком в кавычках и с хвостом `;;`.
+     *
+     * @return list<string>
+     */
+    private function parseCsvLine(string $line): array
+    {
+        $line = trim($line);
+        if ($line === '') {
+            return [];
+        }
+
+        $line = preg_replace('/;;\s*$/', '', $line) ?? $line;
+        if (str_starts_with($line, '"') && str_ends_with($line, '"')) {
+            $line = str_replace('""', '"', substr($line, 1, -1));
+        }
+
+        $row = str_getcsv($line, ',');
+        if ($row === false) {
+            return [];
+        }
+
+        return array_map(static fn($value): string => trim((string) $value), $row);
     }
 }

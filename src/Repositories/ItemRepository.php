@@ -22,7 +22,33 @@ class ItemRepository
         $this->pdo->exec('PRAGMA journal_mode=WAL');
         // Уменьшаем синхронизацию для скорости
         $this->pdo->exec('PRAGMA synchronous=NORMAL');
+        // Ждём освобождения БД при параллельном чтении (DB Browser, второй CLI)
+        $this->pdo->exec('PRAGMA busy_timeout=30000');
         $this->init();
+    }
+
+    /**
+     * @template T
+     * @param callable(): T $operation
+     * @return T
+     */
+    private function runWithBusyRetry(callable $operation, int $maxAttempts = 15)
+    {
+        $attempt = 0;
+        while (true) {
+            try {
+                return $operation();
+            } catch (PDOException $e) {
+                $attempt++;
+                $message = $e->getMessage();
+                $isLocked = str_contains($message, 'database is locked')
+                    || str_contains($message, 'database table is locked');
+                if (!$isLocked || $attempt >= $maxAttempts) {
+                    throw $e;
+                }
+                usleep(200000 * $attempt);
+            }
+        }
     }
 
     public function beginTransaction(): void
@@ -30,15 +56,36 @@ class ItemRepository
         $this->pdo->beginTransaction();
     }
 
+    /** Транзакция с немедленным резервированием блокировки на запись (меньше database is locked). */
+    public function beginWriteTransaction(): void
+    {
+        $this->runWithBusyRetry(function (): void {
+            $this->pdo->exec('BEGIN IMMEDIATE');
+        });
+    }
+
     public function commit(): void
     {
-        $this->pdo->commit();
+        if ($this->pdo->inTransaction()) {
+            $this->pdo->commit();
+            return;
+        }
+
+        // BEGIN IMMEDIATE через exec() не помечает транзакцию в PDO
+        $this->pdo->exec('COMMIT');
     }
 
     public function rollBack(): void
     {
         if ($this->pdo->inTransaction()) {
             $this->pdo->rollBack();
+            return;
+        }
+
+        try {
+            $this->pdo->exec('ROLLBACK');
+        } catch (PDOException) {
+            // уже откатили или транзакции не было
         }
     }
 
@@ -131,6 +178,63 @@ class ItemRepository
         } catch (\PDOException $e) {
             // Игнорируем ошибки создания
         }
+
+        $this->migrateDeletedAdsColumns();
+    }
+
+    /**
+     * Колонки фида в deleted_ads — чтобы снятое объявление можно было выгрузить снова.
+     */
+    private function migrateDeletedAdsColumns(): void
+    {
+        $existing = [];
+        foreach ($this->pdo->query('PRAGMA table_info(deleted_ads)') as $column) {
+            $existing[] = (string) ($column['name'] ?? '');
+        }
+
+        $newColumns = [
+            'phone' => 'TEXT',
+            'contact_method' => 'TEXT',
+            'brand' => 'TEXT',
+            'oem_number' => 'TEXT',
+            'images' => 'TEXT',
+            'description' => 'TEXT',
+            'category_params' => 'TEXT',
+        ];
+
+        foreach ($newColumns as $name => $type) {
+            if (in_array($name, $existing, true)) {
+                continue;
+            }
+            try {
+                $this->pdo->exec("ALTER TABLE deleted_ads ADD COLUMN {$name} {$type}");
+            } catch (\PDOException $e) {
+                // Уже есть
+            }
+        }
+    }
+
+    /**
+     * Снятые объявления из deleted_ads. Новые сверху.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function getDeletedAds(int $limit = 0): array
+    {
+        $sql = 'SELECT * FROM deleted_ads ORDER BY removed_at DESC, id DESC';
+        if ($limit > 0) {
+            $stmt = $this->pdo->prepare($sql . ' LIMIT :limit');
+            $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+            $stmt->execute();
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        return $this->pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    public function getDeletedAdCount(): int
+    {
+        return (int) $this->pdo->query('SELECT COUNT(*) FROM deleted_ads')->fetchColumn();
     }
 
     /**
@@ -169,6 +273,15 @@ class ItemRepository
                 uniq_favorites INTEGER DEFAULT 0,
                 FOREIGN KEY (physical_ad_id) REFERENCES physical_ads(id),
                 UNIQUE(physical_ad_id, date)
+            )
+        ");
+
+        // Служебные пары ключ-значение (например, номер импортированной выгрузки)
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ");
 
@@ -231,6 +344,31 @@ class ItemRepository
         $stmt = $this->pdo->prepare("SELECT * FROM physical_ads WHERE status = 'active'");
         $stmt->execute();
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    /**
+     * Объявления, которые остаются в фиде: активные и помеченные кандидатами.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function getFeedCatalog(): array
+    {
+        $stmt = $this->pdo->query(
+            "SELECT * FROM physical_ads WHERE status IN ('active', 'low_perf') ORDER BY id"
+        );
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    /**
+     * Кандидат остаётся в каталоге. Очередь — таблица republish_candidates_*, не статус.
+     */
+    public function restoreLowPerfStatus(): int
+    {
+        $stmt = $this->pdo->prepare("UPDATE physical_ads SET status = 'active' WHERE status = 'low_perf'");
+        $stmt->execute();
+
+        return $stmt->rowCount();
     }
 
     /**
@@ -384,7 +522,7 @@ class ItemRepository
 
         $sql = "UPDATE physical_ads SET " . implode(', ', $fields) . " WHERE id = :id";
         $stmt = $this->pdo->prepare($sql);
-        $stmt->execute($params);
+        $this->runWithBusyRetry(static fn() => $stmt->execute($params));
 
         return $stmt->rowCount() > 0;
     }
@@ -396,87 +534,120 @@ class ItemRepository
      */
     public function syncFromApi(array $items): array
     {
-        $this->pdo->beginTransaction();
-        try {
-            // 1. Получаем все avito_id из API
-            $apiIds = [];
-            foreach ($items as $item) {
-                $apiIds[(string) ($item['id'] ?? '')] = $item;
+        // 1. Получаем все avito_id из API
+        $apiIds = [];
+        foreach ($items as $item) {
+            $id = (string) ($item['id'] ?? '');
+            if ($id !== '') {
+                $apiIds[$id] = $item;
             }
-
-            // 2. Получаем все avito_id из БД (active + low_perf + old)
-            $dbAds = $this->pdo->query("SELECT avito_id, status FROM physical_ads WHERE status IN ('active', 'low_perf', 'old')")->fetchAll(PDO::FETCH_ASSOC);
-            $dbIds = [];
-            foreach ($dbAds as $ad) {
-                $dbIds[(string) ($ad['avito_id'] ?? '')] = $ad['status'] ?? '';
-            }
-
-            // 3. Находим удалённые объявления (есть в БД, нет на сайте)
-            $removedIds = [];
-            foreach ($dbIds as $avitoId => $status) {
-                if (!isset($apiIds[$avitoId])) {
-                    // Удаляем из БД и переносим в deleted_ads
-                    $existing = $this->getByAvitoId($avitoId);
-                    if ($existing !== null) {
-                        $physicalAdId = (int) $existing['id'];
-                        $masterData = $existing['master_data'] ? json_decode($existing['master_data'], true) : [];
-                        
-                        // Сначала удаляем связанные записи статистики (FK constraint)
-                        $this->deleteStatsForAd($physicalAdId);
-
-                        $stmt = $this->pdo->prepare("
-                            INSERT INTO deleted_ads (avito_id, unique_id, master_data, removed_at, title, price, location)
-                            VALUES (:avito_id, :unique_id, :master_data, :removed_at, :title, :price, :location)
-                        ");
-                        $stmt->execute([
-                            ':avito_id' => $avitoId,
-                            ':unique_id' => $existing['unique_id'] ?? null,
-                            ':master_data' => $existing['master_data'] ?? null,
-                            ':removed_at' => date('Y-m-d H:i:s'),
-                            ':title' => $masterData['title'] ?? '',
-                            ':price' => $masterData['price'] ?? 0,
-                            ':location' => $masterData['location'] ?? '',
-                        ]);
-
-                        // Удаляем из основной таблицы
-                        $this->pdo->prepare("DELETE FROM physical_ads WHERE avito_id = :avito_id")
-                            ->execute([':avito_id' => $avitoId]);
-                        
-                        $removedIds[] = $avitoId;
-                    }
-                }
-            }
-
-            // 4. Обновляем/создаём объявления
-            $created = 0;
-            $updated = 0;
-            $createdIds = [];
-            foreach ($apiIds as $avitoId => $item) {
-                $existing = $this->getByAvitoId($avitoId);
-                if ($existing !== null) {
-                    // Обновляем
-                    $this->upsertFromApiItem($item);
-                    $updated++;
-                } else {
-                    // Создаём новое
-                    $this->upsertFromApiItem($item);
-                    $created++;
-                    $createdIds[] = $avitoId;
-                }
-            }
-
-            $this->pdo->commit();
-            return [
-                'created' => $created,
-                'updated' => $updated,
-                'removed' => count($removedIds),
-                'removed_ids' => $removedIds,
-                'created_ids' => $createdIds,
-            ];
-        } catch (\Throwable $e) {
-            $this->pdo->rollBack();
-            throw $e;
         }
+
+        // 2. Получаем все avito_id из БД (active + low_perf + old)
+        $dbAds = $this->pdo->query("SELECT avito_id, status FROM physical_ads WHERE status IN ('active', 'low_perf', 'old')")->fetchAll(PDO::FETCH_ASSOC);
+        $dbIds = [];
+        foreach ($dbAds as $ad) {
+            $dbIds[(string) ($ad['avito_id'] ?? '')] = $ad['status'] ?? '';
+        }
+
+        // 3. Снятые с публикации — отдельная короткая транзакция
+        $removedIds = [];
+        $this->runWithBusyRetry(function () use ($dbIds, $apiIds, &$removedIds): void {
+            $this->beginWriteTransaction();
+            try {
+                foreach ($dbIds as $avitoId => $status) {
+                    if (isset($apiIds[$avitoId])) {
+                        continue;
+                    }
+
+                    $existing = $this->getByAvitoId($avitoId);
+                    if ($existing === null) {
+                        continue;
+                    }
+
+                    $physicalAdId = (int) $existing['id'];
+                    $masterData = $existing['master_data'] ? json_decode($existing['master_data'], true) : [];
+
+                    $this->deleteStatsForAd($physicalAdId);
+
+                    $stmt = $this->pdo->prepare("
+                        INSERT INTO deleted_ads (
+                            avito_id, unique_id, master_data, removed_at, title, price, location,
+                            phone, contact_method, brand, oem_number, images, description, category_params
+                        )
+                        VALUES (
+                            :avito_id, :unique_id, :master_data, :removed_at, :title, :price, :location,
+                            :phone, :contact_method, :brand, :oem_number, :images, :description, :category_params
+                        )
+                    ");
+                    $locationValue = $existing['location'] ?? $masterData['location'] ?? '';
+                    if (!is_scalar($locationValue)) {
+                        $locationValue = '';
+                    }
+                    $stmt->execute([
+                        ':avito_id' => $avitoId,
+                        ':unique_id' => $existing['unique_id'] ?? null,
+                        ':master_data' => $existing['master_data'] ?? null,
+                        ':removed_at' => date('Y-m-d H:i:s'),
+                        ':title' => $existing['title'] ?? ($masterData['title'] ?? ''),
+                        ':price' => $existing['price'] ?? ($masterData['price'] ?? 0),
+                        ':location' => (string) $locationValue,
+                        ':phone' => $existing['phone'] ?? ($masterData['phone'] ?? ''),
+                        ':contact_method' => $existing['contact_method'] ?? ($masterData['contact_method'] ?? ''),
+                        ':brand' => $existing['brand'] ?? ($masterData['brand'] ?? ''),
+                        ':oem_number' => $existing['oem_number'] ?? ($masterData['oem_number'] ?? ''),
+                        ':images' => $existing['images'] ?? '',
+                        ':description' => $existing['description'] ?? '',
+                        ':category_params' => $existing['category_params'] ?? '',
+                    ]);
+
+                    $this->pdo->prepare("DELETE FROM physical_ads WHERE avito_id = :avito_id")
+                        ->execute([':avito_id' => $avitoId]);
+
+                    $removedIds[] = $avitoId;
+                }
+                $this->commit();
+            } catch (\Throwable $e) {
+                $this->rollBack();
+                throw $e;
+            }
+        });
+
+        // 4. Обновляем/создаём объявления пакетами — не держим одну транзакцию на тысячи строк
+        $created = 0;
+        $updated = 0;
+        $createdIds = [];
+        $chunks = array_chunk($apiIds, 200, true);
+
+        foreach ($chunks as $chunk) {
+            $this->runWithBusyRetry(function () use ($chunk, &$created, &$updated, &$createdIds): void {
+                $this->beginWriteTransaction();
+                try {
+                    foreach ($chunk as $avitoId => $item) {
+                        $existing = $this->getByAvitoId($avitoId);
+                        $this->upsertFromApiItem($item);
+                        if ($existing !== null) {
+                            $updated++;
+                        } else {
+                            $created++;
+                            $createdIds[] = $avitoId;
+                        }
+                    }
+                    $this->commit();
+                } catch (\Throwable $e) {
+                    $this->rollBack();
+                    throw $e;
+                }
+            });
+        }
+
+        return [
+            'created' => $created,
+            'updated' => $updated,
+            'removed' => count($removedIds),
+            'removed_ids' => $removedIds,
+            'created_ids' => $createdIds,
+        ];
     }
 
     /**
@@ -766,13 +937,19 @@ class ItemRepository
             if ($uniqueId === '' && !empty($existing['unique_id'])) {
                 $masterData['unique_id'] = $existing['unique_id'];
             }
+            // Не перезаписываем unique_id из основного API, если он уже заполнен
+            // из Автозагрузки (AutoloadIdSyncService).
+            // Основной API (/core/v1/items) возвращает свой uniqueId — это другое поле.
+            $syncUniqueId = empty($existing['unique_id']) && $uniqueId !== '';
 
             $update = [
                 'status' => $status,
                 'published_at' => $existing['published_at'] ?: $publishedAt,
                 'master_data' => $masterData,
             ];
-            $this->putIfFilled($update, 'unique_id', $uniqueId);
+            if ($syncUniqueId) {
+                $update['unique_id'] = $uniqueId;
+            }
             $this->putIfFilled($update, 'phone', $phone);
             $this->putIfFilled($update, 'contact_method', $contactMethod);
             $this->putIfFilled($update, 'brand', $brand);
@@ -828,15 +1005,26 @@ class ItemRepository
      */
     public function saveStats(int $physicalAdId, array $stats, int $price = 0): void
     {
-        // Группируем записи по месяцам
+        // Группируем записи по месяцам (только дни с активностью из ответа API)
         $byPartition = [];
         foreach ($stats as $stat) {
-            $date = $stat['date'] ?? '';
+            if (!is_array($stat)) {
+                continue;
+            }
+            $date = $this->normalizeStatDate($stat['date'] ?? '');
             if ($date === '') {
                 continue;
             }
+            $row = $this->normalizeStatRow($stat, $date);
+            if (!$this->statHasActivity($row)) {
+                continue;
+            }
             $partitionName = $this->getPartitionName($date);
-            $byPartition[$partitionName][] = $stat;
+            $byPartition[$partitionName][] = $row;
+        }
+
+        if ($byPartition === []) {
+            return;
         }
 
         foreach ($byPartition as $partitionName => $partitionStats) {
@@ -865,13 +1053,13 @@ class ItemRepository
                     ':pad_id' => $physicalAdId,
                     ':date' => $stat['date'],
                     ':views' => (int) ($stat['views'] ?? 0),
-                    ':uniq_views' => (int) ($stat['uniqViews'] ?? 0),
+                    ':uniq_views' => (int) ($stat['uniq_views'] ?? $stat['uniqViews'] ?? 0),
                     ':contacts' => (int) ($stat['contacts'] ?? 0),
-                    ':uniq_contacts' => (int) ($stat['uniqContacts'] ?? 0),
+                    ':uniq_contacts' => (int) ($stat['uniq_contacts'] ?? $stat['uniqContacts'] ?? 0),
                     ':favorites' => (int) ($stat['favorites'] ?? 0),
-                    ':uniq_favorites' => (int) ($stat['uniqFavorites'] ?? 0),
-                    ':phone_shows' => (int) ($stat['contactsShowPhone'] ?? 0),
-                    ':chats' => (int) ($stat['contactsMessenger'] ?? 0),
+                    ':uniq_favorites' => (int) ($stat['uniq_favorites'] ?? $stat['uniqFavorites'] ?? 0),
+                    ':phone_shows' => (int) ($stat['phone_shows'] ?? $stat['contactsShowPhone'] ?? 0),
+                    ':chats' => (int) ($stat['chats'] ?? $stat['contactsMessenger'] ?? 0),
                     ':price' => $price,
                 ]);
             }
@@ -993,6 +1181,48 @@ class ItemRepository
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 
+    private function normalizeStatDate(string $date): string
+    {
+        $date = trim($date);
+        if ($date === '') {
+            return '';
+        }
+
+        if (preg_match('/^(\d{4}-\d{2}-\d{2})/', $date, $matches)) {
+            return $matches[1];
+        }
+
+        return '';
+    }
+
+    /** @param array<string, mixed> $stat */
+    private function normalizeStatRow(array $stat, string $date): array
+    {
+        return [
+            'date' => $date,
+            'views' => (int) ($stat['views'] ?? 0),
+            'uniqViews' => (int) ($stat['uniqViews'] ?? $stat['uniq_views'] ?? 0),
+            'contacts' => (int) ($stat['contacts'] ?? 0),
+            'uniqContacts' => (int) ($stat['uniqContacts'] ?? $stat['uniq_contacts'] ?? 0),
+            'favorites' => (int) ($stat['favorites'] ?? 0),
+            'uniqFavorites' => (int) ($stat['uniqFavorites'] ?? $stat['uniq_favorites'] ?? 0),
+            'contactsShowPhone' => (int) ($stat['contactsShowPhone'] ?? $stat['phone_shows'] ?? 0),
+            'contactsMessenger' => (int) ($stat['contactsMessenger'] ?? $stat['chats'] ?? 0),
+        ];
+    }
+
+    /** @param array<string, mixed> $stat */
+    private function statHasActivity(array $stat): bool
+    {
+        foreach (['views', 'uniqViews', 'contacts', 'uniqContacts', 'favorites', 'uniqFavorites', 'contactsShowPhone', 'contactsMessenger'] as $key) {
+            if ((int) ($stat[$key] ?? 0) > 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /**
      * Определить имя секции по дате.
      */
@@ -1052,6 +1282,34 @@ class ItemRepository
     /**
      * Получить список имён секций для периода.
      */
+    /**
+     * Оставить только statistics_YYYY_MM, которые реально есть в SQLite.
+     *
+     * @param list<string> $partitions
+     * @return list<string>
+     */
+    private function filterExistingStatisticsPartitions(array $partitions): array
+    {
+        $existing = [];
+        foreach ($partitions as $partition) {
+            try {
+                $this->validatePartitionName($partition);
+            } catch (\InvalidArgumentException) {
+                continue;
+            }
+
+            $exists = $this->pdo->query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{$partition}'"
+            )->fetchColumn();
+
+            if ((int) $exists > 0) {
+                $existing[] = $partition;
+            }
+        }
+
+        return $existing;
+    }
+
     public function getPartitionNamesForPeriod(string $dateFrom, string $dateTo): array
     {
         $chunks = $this->splitPeriodIntoMonths($dateFrom, $dateTo);
@@ -1211,6 +1469,161 @@ class ItemRepository
         }
     }
 
+    public function getMeta(string $key): ?string
+    {
+        $stmt = $this->pdo->prepare('SELECT value FROM app_meta WHERE key = :key');
+        $stmt->execute([':key' => $key]);
+        $value = $stmt->fetchColumn();
+
+        return $value === false ? null : (string) $value;
+    }
+
+    public function setMeta(string $key, string $value): void
+    {
+        $this->pdo->prepare(
+            'INSERT INTO app_meta (key, value, updated_at) VALUES (:key, :value, CURRENT_TIMESTAMP)
+             ON CONFLICT(key) DO UPDATE SET value = :value_upd, updated_at = CURRENT_TIMESTAMP'
+        )->execute([
+            ':key' => $key,
+            ':value' => $value,
+            ':value_upd' => $value,
+        ]);
+    }
+
+    /**
+     * Записать колонки фида по номеру объявления на Авито.
+     *
+     * Пустые значения не пишутся: файл не должен стирать уже известные данные.
+     *
+     * @param array<string, array<string, string|int>> $rows avito_id => [колонка => значение]
+     * @param list<string> $allowedColumns
+     * @return array{updated: int, missing: int, skipped: int}
+     */
+    public function updateFeedColumnsByAvitoId(array $rows, array $allowedColumns): array
+    {
+        $result = ['updated' => 0, 'missing' => 0, 'skipped' => 0];
+        if ($rows === []) {
+            return $result;
+        }
+
+        $lookupByAvitoId = $this->pdo->prepare('SELECT id FROM physical_ads WHERE avito_id = :avito_id');
+        $lookupByUniqueId = $this->pdo->prepare('SELECT id FROM physical_ads WHERE unique_id = :unique_id');
+
+        $this->beginTransaction();
+        try {
+            foreach ($rows as $lookupKey => $columns) {
+                $lookupKey = trim((string) $lookupKey);
+                if ($lookupKey === '') {
+                    continue;
+                }
+
+                if (ctype_digit($lookupKey)) {
+                    $lookupByAvitoId->execute([':avito_id' => $lookupKey]);
+                    $id = $lookupByAvitoId->fetchColumn();
+                } else {
+                    $lookupByUniqueId->execute([':unique_id' => $lookupKey]);
+                    $id = $lookupByUniqueId->fetchColumn();
+                }
+                if ($id === false) {
+                    $result['missing']++;
+                    continue;
+                }
+
+                $fields = [];
+                $params = [':id' => (int) $id];
+                foreach ($columns as $column => $value) {
+                    if (!in_array($column, $allowedColumns, true)) {
+                        continue;
+                    }
+                    if ($value === '' || $value === null) {
+                        continue;
+                    }
+                    $fields[] = "{$column} = :{$column}";
+                    $params[":{$column}"] = $value;
+                }
+
+                if ($fields === []) {
+                    $result['skipped']++;
+                    continue;
+                }
+
+                $sql = 'UPDATE physical_ads SET ' . implode(', ', $fields) . ' WHERE id = :id';
+                $this->pdo->prepare($sql)->execute($params);
+                $result['updated']++;
+            }
+            $this->commit();
+        } catch (\Throwable $e) {
+            $this->rollBack();
+            throw $e;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Номера Авито, для которых нужно запросить Id из автозагрузки.
+     *
+     * @return list<string>
+     */
+    public function listAvitoIdsForUniqueSync(bool $all): array
+    {
+        if ($all) {
+            $sql = "SELECT avito_id FROM physical_ads
+                    WHERE avito_id IS NOT NULL AND avito_id != ''
+                      AND status IN ('active', 'low_perf')
+                    ORDER BY id";
+        } else {
+            $sql = "SELECT avito_id FROM physical_ads
+                    WHERE avito_id IS NOT NULL AND avito_id != ''
+                      AND status IN ('active', 'low_perf')
+                      AND (unique_id IS NULL OR unique_id = '' OR unique_id = avito_id)
+                    ORDER BY id";
+        }
+
+        $ids = $this->pdo->query($sql)->fetchAll(PDO::FETCH_COLUMN);
+
+        return array_values(array_map('strval', $ids));
+    }
+
+    /**
+     * Записать Id из файла автозагрузки.
+     *
+     * @param array<string, string> $pairs avito_id => ad_id
+     */
+    public function applyAutoloadIds(array $pairs): int
+    {
+        $stmt = $this->pdo->prepare(
+            "UPDATE physical_ads
+             SET unique_id = :unique_id
+             WHERE avito_id = :avito_id
+               AND (unique_id IS NULL OR unique_id != :unique_id_cmp)"
+        );
+
+        $updated = 0;
+        $this->beginTransaction();
+        try {
+            foreach ($pairs as $avitoId => $adId) {
+                $avitoId = trim((string) $avitoId);
+                $adId = trim($adId);
+                if ($avitoId === '' || $adId === '') {
+                    continue;
+                }
+                $stmt->execute([
+                    ':unique_id' => $adId,
+                    ':unique_id_cmp' => $adId,
+                    ':avito_id' => $avitoId,
+                ]);
+                $updated += $stmt->rowCount();
+            }
+            $this->commit();
+        } catch (\Throwable $e) {
+            $this->rollBack();
+            throw $e;
+        }
+
+        return $updated;
+    }
+
     /**
      * Номера Авито, для которых нужно запросить Id из автозагрузки.
      *
@@ -1286,7 +1699,10 @@ class ItemRepository
             AND deactivated_at LIKE :date
         ");
         $stmt->execute([':date' => $today . '%']);
-        return (int) $stmt->fetchColumn();
+        $fromAds = (int) $stmt->fetchColumn();
+        $fromFeed = (int) ($this->getMeta('feed_repub_' . $today) ?? '0');
+
+        return $fromAds + $fromFeed;
     }
 
     /**
@@ -1365,10 +1781,12 @@ class ItemRepository
         $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
         $dateTo = date('Y-m-d', strtotime('-1 day'));
 
-        // Получаем список секций статистики за период
-        $partitions = $this->getPartitionNamesForPeriod($dateFrom, $dateTo);
+        // Только существующие секции: getPartitionNamesForPeriod может вернуть месяцы без таблиц.
+        $partitions = $this->filterExistingStatisticsPartitions(
+            $this->getPartitionNamesForPeriod($dateFrom, $dateTo)
+        );
 
-        if (empty($partitions)) {
+        if ($partitions === []) {
             return [];
         }
 
@@ -1541,12 +1959,16 @@ class ItemRepository
     private function deleteStatsForAd(int $physicalAdId): void
     {
         // Удаляем из старой таблицы stats
-        $this->pdo->prepare("DELETE FROM stats WHERE physical_ad_id = :id")
-            ->execute([':id' => $physicalAdId]);
+        $stmt = $this->pdo->prepare('DELETE FROM stats WHERE physical_ad_id = :id');
+        $this->runWithBusyRetry(static fn() => $stmt->execute([':id' => $physicalAdId]));
 
-        // Удаляем из stats_old (тоже имеет FK)
-        $this->pdo->prepare("DELETE FROM stats_old WHERE physical_ad_id = :id")
-            ->execute([':id' => $physicalAdId]);
+        $statsOldExists = (int) $this->pdo->query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='stats_old'"
+        )->fetchColumn();
+        if ($statsOldExists > 0) {
+            $stmtOld = $this->pdo->prepare('DELETE FROM stats_old WHERE physical_ad_id = :id');
+            $this->runWithBusyRetry(static fn() => $stmtOld->execute([':id' => $physicalAdId]));
+        }
 
         // Удаляем из всех partition таблиц статистики
         $stmt = $this->pdo->query("SELECT partition_name FROM stats_meta ORDER BY partition_name");
@@ -1564,8 +1986,8 @@ class ItemRepository
             )->fetchColumn();
 
             if ((int) $exists > 0) {
-                $this->pdo->prepare("DELETE FROM {$partition} WHERE physical_ad_id = :id")
-                    ->execute([':id' => $physicalAdId]);
+                $del = $this->pdo->prepare("DELETE FROM {$partition} WHERE physical_ad_id = :id");
+                $this->runWithBusyRetry(static fn() => $del->execute([':id' => $physicalAdId]));
             }
         }
 
@@ -1585,8 +2007,8 @@ class ItemRepository
             )->fetchColumn();
 
             if ((int) $exists > 0) {
-                $this->pdo->prepare("DELETE FROM {$partition} WHERE physical_ad_id = :id")
-                    ->execute([':id' => $physicalAdId]);
+                $del = $this->pdo->prepare("DELETE FROM {$partition} WHERE physical_ad_id = :id");
+                $this->runWithBusyRetry(static fn() => $del->execute([':id' => $physicalAdId]));
             }
         }
     }

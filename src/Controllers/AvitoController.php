@@ -4,6 +4,7 @@ namespace App\Controllers;
 
 use App\Repositories\ItemRepository;
 use App\Services\AnalysisService;
+use App\Services\AutoloadFeedImportService;
 use App\Services\AutoloadIdSyncService;
 use App\Services\AvitoAPIClient;
 use App\Services\FeedGeneratorService;
@@ -43,8 +44,30 @@ class AvitoController
      */
     public function run(): void
     {
+        $this->executePipeline(false);
+    }
+
+    /**
+     * Тот же цикл, что run, но фид для проверки на Авито.
+     *
+     * Блок снятия пишется даже если дневной лимит уже занят.
+     * Очередь кандидатов и счётчик дня не меняются.
+     *
+     * @param int $forcedRemoval Если больше 0 — столько первых объявлений каталога в блок снятия, без поиска кандидатов
+     */
+    public function runTest(int $forcedRemoval = 0): void
+    {
+        $this->executePipeline(true, $forcedRemoval);
+    }
+
+    private function executePipeline(bool $keepQueue, int $forcedRemoval = 0): void
+    {
         echo str_repeat('=', 60) . "\n";
-        echo "  Avito Republisher -- Start\n";
+        echo $forcedRemoval > 0
+            ? "  Avito Republisher -- Test feed ({$forcedRemoval} на снятие без кандидатов)\n"
+            : ($keepQueue
+                ? "  Avito Republisher -- Test feed (очередь не списывается)\n"
+                : "  Avito Republisher -- Start\n");
         echo str_repeat('=', 60) . "\n";
         flush();
 
@@ -56,6 +79,7 @@ class AvitoController
             flush();
         });
         $syncResult = $this->repository->syncFromApi($items);
+        $restored = $this->repository->restoreLowPerfStatus();
         $active = $this->repository->getActive();
         
         echo "  Создано новых: " . $syncResult['created'] . "\n";
@@ -65,12 +89,16 @@ class AvitoController
             echo "  Удалённые avito_id: " . implode(', ', $syncResult['removed_ids']) . "\n";
         }
         echo "  Active ads в БД: " . count($active) . "\n";
+        if ($restored > 0) {
+            echo "  Возвращено из low_perf: {$restored}\n";
+        }
 
         if (empty($active)) {
             echo "  No active ads -- exit\n";
             return;
         }
 
+        $this->importFeedFromApi(false);
         $this->syncUniqueIds(false);
 
         // 2. Сбор статистики
@@ -79,29 +107,36 @@ class AvitoController
         $statsDays = (int) ($this->config['avito']['stats_days'] ?? 3);
         $this->republisher->collectStats($statsDays);
 
-        // 3. Поиск кандидатов (запись в republish_candidates_*)
-        echo "\n  --- Find Candidates ---\n";
-        flush();
-        $candidateResult = $this->republisher->collectCandidates(4);
-        echo "  Найдено: {$candidateResult['found']}\n";
-        echo "  Добавлено: {$candidateResult['added']}\n";
-        echo "  Уже были: {$candidateResult['skipped']}\n";
+        $candidateResult = ['found' => 0, 'added' => 0, 'skipped' => 0];
+        if ($forcedRemoval > 0) {
+            echo "\n  --- Find Candidates ---\n";
+            echo "  Пропуск: тест берёт {$forcedRemoval} объявлений каталога без очереди\n";
+        } else {
+            // 3. Поиск кандидатов (запись в republish_candidates_*)
+            echo "\n  --- Find Candidates ---\n";
+            flush();
+            $candidateResult = $this->republisher->collectCandidates(4);
+            echo "  Найдено: {$candidateResult['found']}\n";
+            echo "  Добавлено: {$candidateResult['added']}\n";
+            echo "  Уже были: {$candidateResult['skipped']}\n";
+        }
 
         // 4. Генерация фида
         echo "\n  --- Generate Feed ---\n";
         flush();
         $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config);
-        $feedResult = $feedGenerator->generate(false);
+        $feedResult = $feedGenerator->generate(false, $keepQueue, $forcedRemoval);
         if ($feedResult['count'] > 0) {
-            echo "  Фид: {$feedResult['file']} ({$feedResult['count']} объявлений, " . count($feedResult['headers']) . " столбцов)\n";
+            echo "  Фид XML: {$feedResult['file']} ({$feedResult['count']} объявлений)\n";
+            if (!empty($feedResult['csv_file'])) {
+                echo "  Фид CSV: {$feedResult['csv_file']}\n";
+            }
         }
 
-        // 5. Итог — републикация НЕ выполняется автоматически!
-        //    Для републикации используйте: php index.php republish-all <count>
         echo "\n  --- Итог ---\n";
-        echo "  Кандидатов добавлено: " . $candidateResult['added'] . "\n";
-        echo "  Для републикации: php index.php republish-all <count>\n";
-        echo "  (например: php index.php republish-all 20)\n";
+        echo "  Кандидатов добавлено в очередь: " . $candidateResult['added'] . "\n";
+        echo "  В фиде на снятие: " . count($feedResult['candidate_avito_ids'] ?? []) . "\n";
+        echo "  Объявлений в файле: " . ($feedResult['count'] ?? 0) . "\n";
 
         echo "\n" . str_repeat('=', 60) . "\n";
         echo "  Done\n";
@@ -131,8 +166,12 @@ class AvitoController
         // 1. Получаем active ads из БД
         echo "\n  --- Active Ads из БД ---\n";
         flush();
+        $restored = $this->repository->restoreLowPerfStatus();
         $active = $this->repository->getActive();
         echo "  Active ads в БД: " . count($active) . "\n";
+        if ($restored > 0) {
+            echo "  Возвращено из low_perf: {$restored}\n";
+        }
 
         if (empty($active)) {
             echo "  Нет активных объявлений -- exit\n";
@@ -152,11 +191,7 @@ class AvitoController
         echo "  Осталось: {$remaining}\n";
 
         if ($remaining <= 0) {
-            echo "  [SKIP] Дневной лимит исчерпан\n";
-            echo "\n" . str_repeat('=', 60) . "\n";
-            echo "  Done (лимит исчерпан)\n";
-            echo str_repeat('=', 60) . "\n";
-            return;
+            echo "  Дневной лимит снятий исчерпан. В фид пойдёт только каталог.\n";
         }
 
         // 4. Собираем кандидатов
@@ -174,13 +209,10 @@ class AvitoController
         $feedResult = $feedGenerator->generate(false);
         
         if ($feedResult['count'] > 0) {
-            echo "  Фид: {$feedResult['file']} ({$feedResult['count']} объявлений, " . count($feedResult['headers']) . " столбцов)\n";
-        }
-
-        // 6. Удаляем включённых кандидатов из БД
-        if (!empty($feedResult['candidate_avito_ids'])) {
-            echo "\n  --- Удаление кандидатов из БД ---\n";
-            $feedGenerator->removeCandidatesFromDb($feedResult['candidate_avito_ids']);
+            echo "  Фид XML: {$feedResult['file']} ({$feedResult['count']} объявлений)\n";
+            if (!empty($feedResult['csv_file'])) {
+                echo "  Фид CSV: {$feedResult['csv_file']}\n";
+            }
         }
 
         echo "\n  --- Итог ---\n";
@@ -431,12 +463,26 @@ class AvitoController
     public function collectStatsToDatabase(int $days = 30): void
     {
         echo "Collecting statistics for advertisements of all supported statuses...\n";
-        $result = $this->republisher->collectAllActiveStats($days);
+        try {
+            $result = $this->republisher->collectAllActiveStats($days);
+        } catch (PDOException $e) {
+            if (str_contains($e->getMessage(), 'database is locked')) {
+                fwrite(
+                    STDERR,
+                    "\n  [ERROR] SQLite занята другим процессом (database is locked).\n"
+                    . "  Закройте DB Browser / просмотр data/avito.db в IDE и повторите команду.\n"
+                    . "  Не запускайте два collect-stats или run параллельно.\n\n"
+                );
+            }
+            throw $e;
+        }
 
         echo "\nCompleted\n";
         echo "  Period:       {$result['date_from']} — {$result['date_to']}\n";
         echo "  Loaded ads:   {$result['items']}\n";
         echo "  New DB ads:   {$result['created']}\n";
+        echo "  Updated ads:  {$result['updated']}\n";
+        echo "  Removed ads:  {$result['removed']}\n";
         echo "  Saved ads:    {$result['saved_items']}\n";
         echo "  Failed batch: {$result['failed_batches']}\n";
     }
@@ -691,7 +737,57 @@ class AvitoController
     }
 
     /**
-     * Сгенерировать TSV фид для Avito AutoLoad (HTTP POST)
+     * Фид из кабинета: неактивные (removed, old) активируются, плюс текущие active.
+     *
+     * CLI: php index.php feed-inactive [count] [--only-inactive]
+     */
+    public function generateInactiveFeed(int $limit = 0, bool $includeActive = true): ?string
+    {
+        $cli = php_sapi_name() === 'cli';
+        if (!$cli) {
+            $input = json_decode((string) file_get_contents('php://input'), true);
+            if (is_array($input)) {
+                if (isset($input['count'])) {
+                    $limit = (int) $input['count'];
+                }
+                if (array_key_exists('include_active', $input)) {
+                    $includeActive = (bool) $input['include_active'];
+                }
+            } elseif (isset($_GET['count'])) {
+                $limit = (int) $_GET['count'];
+            }
+        }
+
+        if ($cli) {
+            echo str_repeat('=', 60) . "\n";
+            echo "  Feed from Avito cabinet (inactive → active)\n";
+            echo str_repeat('=', 60) . "\n";
+            flush();
+        }
+
+        $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config);
+        $result = $feedGenerator->generateFromCabinet($limit, $includeActive);
+
+        if ($cli) {
+            echo "\n  Файл: {$result['file']}\n";
+            echo str_repeat('=', 60) . "\n";
+            return null;
+        }
+
+        return json_encode([
+            'status' => 'success',
+            'file' => $result['file'] ?? '',
+            'xml_file' => $result['xml_file'] ?? '',
+            'csv_file' => $result['csv_file'] ?? '',
+            'count' => $result['count'] ?? 0,
+            'inactive_count' => $result['inactive_count'] ?? 0,
+            'active_count' => $result['active_count'] ?? 0,
+            'status_counts' => $result['status_counts'] ?? [],
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Сгенерировать XML/CSV фид для Avito AutoLoad (HTTP POST)
      *
      * @param bool $priorityMode Приоритетный режим (кандидаты первыми)
      */
@@ -704,6 +800,8 @@ class AvitoController
             return json_encode([
                 'status' => 'success',
                 'file' => $result['file'] ?? '',
+                'xml_file' => $result['xml_file'] ?? '',
+                'csv_file' => $result['csv_file'] ?? '',
                 'count' => $result['count'] ?? 0,
                 'headers' => $result['headers'] ?? [],
                 'priority_mode' => $priorityMode,
@@ -755,9 +853,9 @@ class AvitoController
      * HTTP: POST /republish-feeds с телом {"count": 10}
      * CLI:  php index.php republish-feeds <count>
      *
-     * Формат: ОДИН фид с mixed operations (remove + update)
+     * Формат: сверху снятие порции из очереди, ниже весь каталог, включая кандидатов.
      *
-     * @param int|null $count Количество кандидатов для включения (до 70), null для HTTP
+     * @param int|null $count Сколько кандидатов снять сверху (не больше 70 и дневного остатка), null для HTTP
      * @param bool $cli Режим CLI (true) или HTTP (false)
      */
     public function generateRepublishFeeds(?int $count = null, bool $cli = true): mixed
@@ -784,35 +882,18 @@ class AvitoController
         $feedService = new RepublishFeedService($this->repository, $this->apiClient, $this->config);
         $candidates = $feedService->getCandidates();
 
-        if (empty($candidates)) {
-            if ($cli) {
-                echo "  Нет кандидатов для переопубликования\n";
-                echo "  Сначала выполните: php index.php collect-candidates\n";
-                return null;
-            } else {
-                return json_encode([
-                    'status' => 'success',
-                    'message' => 'Нет кандидатов для переопубликования',
-                    'feed_file' => '',
-                    'count' => 0,
-                ], JSON_UNESCAPED_UNICODE);
-            }
-        }
-
-        // Проверка лимита
-        $maxCount = min($count, 70);
-        if ($maxCount > count($candidates)) {
-            $maxCount = count($candidates);
-        }
+        // Проверка лимита. Пустая очередь не отменяет фид: каталог всё равно пишется.
+        $maxDailyRepub = (int) ($this->config['avito']['max_daily_repub'] ?? 70);
+        $maxCount = min($count, $maxDailyRepub);
 
         if ($cli) {
             echo "\n";
             echo str_repeat('=', 60) . "\n";
-            echo "  ГЕНЕРАЦИЯ ФИДА ДЛЯ РЕПУБЛИКАЦИИ\n";
-            echo "  (ОДИН фид с mixed operations: remove + update)\n";
+            echo "  ГЕНЕРАЦИЯ ФИДА\n";
+            echo "  Сверху — снятие из очереди, ниже — весь каталог, включая кандидатов\n";
             echo str_repeat('=', 60) . "\n";
-            echo "  Всего кандидатов:  " . count($candidates) . "\n";
-            echo "  Включим в фид:     {$maxCount}\n";
+            echo "  В очереди:         " . count($candidates) . "\n";
+            echo "  Снять не больше:   {$maxCount}\n";
             echo str_repeat('=', 60) . "\n\n";
 
             // Показываем первых 5 кандидатов
@@ -837,6 +918,13 @@ class AvitoController
 
             if (!empty($result['feed_file'])) {
                 echo "\n  [OK] Фид сгенерирован успешно\n";
+                echo "  XML: {$result['feed_file']}\n";
+                if (!empty($result['csv_file'])) {
+                    echo "  CSV: {$result['csv_file']}\n";
+                }
+                echo "  Снятие сверху: " . ($result['count'] ?? 0) . "\n";
+                echo "  Каталог ниже:  " . ($result['catalog_count'] ?? 0) . "\n";
+                echo "  Объявлений:    " . ($result['total_rows'] ?? 0) . "\n";
                 echo "\n  Следующие шаги:\n";
                 echo "    1. Проверить файл в директории fid/\n";
                 echo "    2. Загрузить фид на облако Avito\n";
@@ -854,7 +942,11 @@ class AvitoController
         return json_encode([
             'status' => 'success',
             'feed_file' => $result['feed_file'] ?? '',
+            'xml_file' => $result['xml_file'] ?? '',
+            'csv_file' => $result['csv_file'] ?? '',
             'count' => $result['count'] ?? 0,
+            'catalog_count' => $result['catalog_count'] ?? 0,
+            'total_rows' => $result['total_rows'] ?? 0,
             'candidates' => array_map(function ($ad) {
                 $masterData = json_decode($ad['master_data'] ?? '', true);
                 return [
@@ -881,115 +973,36 @@ class AvitoController
     }
 
     /**
-     * Ручной импорт CSV из кабинета. В run() больше не вызывается.
+     * Скачать файл последней выгрузки по API и записать его в БД.
+     *
+     * Заменяет ручное скачивание фида из кабинета: фото, описание,
+     * производителя и OEM API объявлений не отдаёт.
      */
-    public function importFeedFromFile(?string $path = null): void
+    public function importFeedFromApi(bool $force = false): void
+    {
+        echo "\n  --- Import AutoLoad Feed (API) ---\n";
+        flush();
+        $service = new AutoloadFeedImportService($this->apiClient, $this->repository, $this->config);
+        $service->syncFromApi($force);
+    }
+
+    /**
+     * Импорт файла выгрузки с диска: XLSX или CSV.
+     */
+    public function importFeedFromFile(?string $path = null, bool $dryRun = false): void
     {
         $feedPath = $path ?? (string) ($this->config['feed']['autoload_source'] ?? '');
-        echo "\n  --- Import AutoLoad Feed ---\n";
+        echo "\n  --- Import AutoLoad Feed (файл) ---\n";
         if ($feedPath === '' || !file_exists($feedPath)) {
             echo "  Файл не найден: {$feedPath}\n";
             return;
         }
         echo "  Файл: {$feedPath}\n";
-        $imported = $this->importAutoloadFeed($feedPath);
-        echo "  Импортировано: {$imported} объявлений\n";
-    }
-
-    /**
-     * Импорт данных из AutoLoad CSV файла Avito
-     *
-     * Заполняет колонки БД: unique_id, phone, description, images, brand, oem_number, title, location, price
-     *
-     * @return int Количество обновлённых записей
-     */
-    private function importAutoloadFeed(string $filePath): int
-    {
-        $raw = file_get_contents($filePath);
-        if ($raw === false) {
-            return 0;
+        if ($dryRun) {
+            echo "  Режим: разбор без записи в БД\n";
         }
-
-        // Убираем BOM
-        if (substr($raw, 0, 3) === "\xEF\xBB\xBF") {
-            $raw = substr($raw, 3);
-        }
-
-        $lines = explode("\n", $raw);
-        $lines = array_map('rtrim', $lines);
-        $lines = array_values(array_filter($lines, fn($l) => trim($l) !== ''));
-
-        if (count($lines) < 8) {
-            return 0;
-        }
-
-        // Строка 2 — заголовки
-        $headers = str_getcsv($lines[1], ';');
-
-        // Строки 8+ — данные
-        $dataLines = array_slice($lines, 7);
-
-        // Маппинг
-        $headerMap = [];
-        foreach ($headers as $i => $h) {
-            $headerMap[trim($h)] = $i;
-        }
-
-        $stmt = $this->pdo->prepare("
-            UPDATE physical_ads SET 
-                unique_id = :unique_id,
-                phone = :phone,
-                description = :description,
-                images = :images,
-                brand = :brand,
-                oem_number = :oem_number,
-                title = :title,
-                location = :location,
-                price = :price
-            WHERE avito_id = :avito_id
-        ");
-
-        $updated = 0;
-        foreach ($dataLines as $line) {
-            $row = str_getcsv($line, ';');
-
-            $avitoId = trim($row[$headerMap['Номер объявления на Авито']] ?? '');
-            if ($avitoId === '') continue;
-
-            // Ищем в БД
-            $existing = $this->pdo->prepare("SELECT id FROM physical_ads WHERE avito_id = :avito_id");
-            $existing->execute([':avito_id' => $avitoId]);
-            $dbRow = $existing->fetch(PDO::FETCH_ASSOC);
-
-            if ($dbRow === false) continue;
-
-            $uniqueId = trim($row[$headerMap['Уникальный идентификатор объявления']] ?? '');
-            $phone = trim($row[$headerMap['Номер телефона']] ?? '');
-            $description = strip_tags(trim($row[$headerMap['Описание объявления']] ?? ''));
-            $imagesRaw = trim($row[$headerMap['Ссылки на фото']] ?? '');
-            $images = $imagesRaw !== '' ? json_encode(explode('|', $imagesRaw), JSON_UNESCAPED_UNICODE) : '';
-            $brand = trim($row[$headerMap['Производитель']] ?? '');
-            $oem = trim($row[$headerMap['Номер детали OEM']] ?? '');
-            $title = trim($row[$headerMap['Название объявления']] ?? '');
-            $address = trim($row[$headerMap['Адрес']] ?? '');
-            $price = (int) ($row[$headerMap['Цена']] ?? 0);
-
-            $stmt->execute([
-                ':unique_id' => $uniqueId,
-                ':phone' => $phone,
-                ':description' => $description,
-                ':images' => $images,
-                ':brand' => $brand,
-                ':oem_number' => $oem,
-                ':title' => $title,
-                ':location' => $address,
-                ':price' => $price,
-                ':avito_id' => $avitoId,
-            ]);
-
-            $updated++;
-        }
-
-        return $updated;
+        flush();
+        $service = new AutoloadFeedImportService($this->apiClient, $this->repository, $this->config);
+        $service->importFile($feedPath, $dryRun);
     }
 }

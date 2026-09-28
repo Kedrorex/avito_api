@@ -40,6 +40,7 @@ return function (App $app) {
 
     // Генерация фида для Avito AutoLoad
     $app->post('/feed/generate', \App\Controllers\AvitoController::class . ':generateFeed');
+    $app->post('/feed/inactive', \App\Controllers\AvitoController::class . ':generateInactiveFeed');
     $app->get('/feed/info', \App\Controllers\AvitoController::class . ':getFeedInfo');
 
     // Генерация фидов для переопубликования

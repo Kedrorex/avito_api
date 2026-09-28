@@ -80,6 +80,16 @@ if ($cli) {
         case 'run':
             $controller->run();
             break;
+        case 'run-test':
+            $forcedRemoval = isset($argv[2]) ? (int) $argv[2] : 0;
+            if (isset($argv[2]) && ($forcedRemoval < 1 || $forcedRemoval > 70)) {
+                echo "Usage: php index.php run-test [count: 1..70]\n";
+                echo "  Без числа — снятие из очереди кандидатов, очередь не списывается.\n";
+                echo "  С числом — столько первых объявлений каталога в блок снятия, без проверки кандидатов по avito_id.\n";
+                exit(1);
+            }
+            $controller->runTest($forcedRemoval);
+            break;
         case 'feed-only':
             $controller->runFeedOnly();
             break;
@@ -153,25 +163,46 @@ if ($cli) {
             $controller->showCandidates();
             break;
         case 'feed':
-            // Парсим флаги --priority и --flat
-            $priorityMode = true; // по умолчанию — приоритетный
+            // Парсим флаги --priority, --flat, --keep-queue
+            $priorityMode = true;
+            $keepQueue = false;
             for ($i = 2; $i < count($argv); $i++) {
                 if ($argv[$i] === '--flat') {
                     $priorityMode = false;
                 } elseif ($argv[$i] === '--priority') {
                     $priorityMode = true;
+                } elseif ($argv[$i] === '--keep-queue') {
+                    $keepQueue = true;
                 }
             }
             $feedGenerator = new \App\Services\FeedGeneratorService($repository, $apiClient, $config);
-            $result = $feedGenerator->generate($priorityMode);
+            $result = $feedGenerator->generate($priorityMode, $keepQueue);
             if ($result['count'] > 0) {
-                echo "\n  Заголовки (первые 5):\n";
-                foreach (array_slice($result['headers'], 0, 5) as $i => $h) {
-                    echo "    " . ($i + 1) . ". {$h}\n";
-                }
-                echo "    ... всего: " . count($result['headers']) . "\n";
                 echo "  Режим: " . ($priorityMode ? 'приоритетный' : 'обычный') . "\n";
             }
+            break;
+        case 'feed-keep':
+            $keep = isset($argv[2]) ? (int) $argv[2] : 10;
+            if ($keep < 1 || $keep > 500) {
+                echo "Usage: php index.php feed-keep [count]\n";
+                echo "  По умолчанию 10. В файле только эти объявления, остальные Авито снимет.\n";
+                exit(1);
+            }
+            $feedGenerator = new \App\Services\FeedGeneratorService($repository, $apiClient, $config);
+            $feedGenerator->generateKeep($keep);
+            break;
+        case 'feed-inactive':
+        case 'feed-deleted':
+            $limit = 0;
+            $includeActive = true;
+            for ($i = 2; $i < count($argv); $i++) {
+                if ($argv[$i] === '--only-inactive') {
+                    $includeActive = false;
+                } elseif (ctype_digit((string) $argv[$i])) {
+                    $limit = (int) $argv[$i];
+                }
+            }
+            $controller->generateInactiveFeed($limit, $includeActive);
             break;
         case 'feed-info':
             $feedGenerator = new \App\Services\FeedGeneratorService($repository, $apiClient, $config);
@@ -188,11 +219,9 @@ if ($cli) {
             $count = isset($argv[2]) ? (int) $argv[2] : 0;
             if ($count <= 0) {
                 echo "Usage: php index.php republish-feeds <count: 1..70>\n";
-                echo "  Генерирует ОДИН TSV фид для переопубликования:\n";
-                echo "  Формат: mixed operations (remove + update в одном файле)\n";
-                echo "  Avito AutoLoad обрабатывает фид последовательно:\n";
-                echo "    1. Сначала все remove (снять с публикации)\n";
-                echo "    2. Затем все update (вновь включить с полными данными)\n";
+                echo "  Тот же фид, что и feed: сверху снятие порции из очереди,\n";
+                echo "  ниже весь каталог, включая этих кандидатов.\n";
+                echo "  count ограничивает снятие, но не выкидывает остальные объявления.\n";
                 exit(1);
             }
             $controller->generateRepublishFeeds($count, true);
@@ -265,8 +294,14 @@ if ($cli) {
             $controller->syncUniqueIds($all);
             break;
         case 'import-feed':
+            $force = in_array('--force', $argv, true);
+            $dryRun = in_array('--dry-run', $argv, true);
             $feedPath = $argv[2] ?? null;
-            $controller->importFeedFromFile(is_string($feedPath) ? $feedPath : null);
+            if (is_string($feedPath) && !str_starts_with($feedPath, '--')) {
+                $controller->importFeedFromFile($feedPath, $dryRun);
+            } else {
+                $controller->importFeedFromApi($force);
+            }
             break;
         case 'migrate-unique-id':
             // Миграция: заполняет unique_id из master_data для существующих объявлений
@@ -293,7 +328,7 @@ if ($cli) {
             break;
         default:
             echo "Unknown command: {$command}\n";
-            echo "Available: run, feed-only, sync, active, status-counts, republish, republish-all, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-info, republish-feeds, analyze, analyze-report, sync-unique-ids, import-feed, migrate-unique-id\n";
+            echo "Available: run, run-test, feed-only, sync, active, status-counts, republish, republish-all, stats, item, collect-stats, ad, collect-candidates, show-candidates, feed, feed-keep, feed-inactive, feed-info, republish-feeds, analyze, analyze-report, sync-unique-ids, import-feed, migrate-unique-id\n";
             exit(1);
     }
 } else {

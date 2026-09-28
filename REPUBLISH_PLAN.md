@@ -14,7 +14,19 @@
 
 ---
 
-## Target Architecture
+## Как фид собирается сейчас
+
+Один CSV `fid/avito_feed_YYYY-MM-DD.csv`:
+
+1. Очередь `republish_candidates_*`, сначала самые старые, не больше `max_daily_repub` (70) с учётом уже потраченного за день.
+2. Эти объявления — первые строки файла, `AvitoStatus=removed`.
+3. Затем все объявления каталога (`active` и `low_perf`), `AvitoStatus=active`, включая только что снятых кандидатов.
+
+Отдельный файл только из кандидатов не используется: автозагрузка снимет всё, чего в фиде нет. Команды `feed`, `feed-only`, `run` и `republish-feeds` пишут этот один файл. `republish-feeds <count>` лишь уменьшает блок снятия.
+
+Дневной счётчик: `app_meta.feed_repub_YYYY-MM-DD` плюс републикации через API. Порция, попавшая в блок снятия, после записи файла уходит из очереди.
+
+## Target Architecture (устарело, не использовать)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -135,32 +147,9 @@ User requests: "Generate feeds for republishing N candidates"
 - **Additional fix**: Removed `published_at IS NOT NULL` check (was NULL for all ads)
 - **Result**: 8032 candidates found and added to `republish_candidates_2026_09`
 
-### Phase 2: Generate 2 Feeds for Republishing ✅
-- **Created**: `src/Services/RepublishFeedService.php`
-- **CLI command**: `php index.php republish-feeds <count>`
-- **HTTP endpoint**: `POST /republish-feeds` with `{"count": 10}`
-- **Feed #1**: `avito_feed_deactivate_YYYY-MM-DD_HH-mm-ss.tsv` (operation="remove")
-- **Feed #2**: `avito_feed_reactivate_YYYY-MM-DD_HH-mm-ss.tsv` (operation="update" + full data)
+### Phase 2: два отдельных фида — отменено
 
-### Test Results
-```
-Всего кандидатов: 8032
-Feed #1 (deactivate): avito_feed_deactivate_2026-09-16_125059.tsv (3 объявлений)
-Feed #2 (reactivate): avito_feed_reactivate_2026-09-16_125059.tsv (3 объявлений)
-```
-
-**Feed #1 (deactivate)**:
-```
-Уникальный идентификатор объявления	Номер объявления на Авито	operation
-deactivate_8012122614	8012122614	remove
-deactivate_8012122223	8012122223	remove
-```
-
-**Feed #2 (reactivate)**:
-```
-Уникальный идентификатор объявления	Номер объявления на Авито	operation	Категория	Описание объявления	Название объявления	Цена	...
-reactivate_8012122614	8012122614	update	Запчасти и аксессуары	Двигатель Hyundai Matrix G4ED в наличии	Двигатель Hyundai Matrix G4ED в наличии	108000	...
-```
+Два файла (deactivate и reactivate) и фид только из кандидатов не используются. Рабочее правило — раздел «Как фид собирается сейчас» в начале этого файла. `RepublishFeedService` только вызывает `FeedGeneratorService`.
 
 ### Next steps:
 1. Implement cloud upload

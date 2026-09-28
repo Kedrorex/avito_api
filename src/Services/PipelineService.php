@@ -398,12 +398,12 @@ class PipelineService
     }
 
     /**
-     * Шаг 5: FEED — Генерация CSV фида
+     * Шаг 5: FEED — Генерация XML/CSV фида
      */
     private function stepFeed(bool $cli): void
     {
         echo "\n" . str_repeat('-', 60) . "\n";
-        echo "  ШАГ 5: GENERATE FEED — Генерация CSV фида\n";
+        echo "  ШАГ 5: GENERATE FEED — Генерация XML фида\n";
         echo str_repeat('-', 60) . "\n";
         flush();
 

@@ -69,7 +69,13 @@ final class AvitoAPIClient implements AutoloadIdProvider
     }
 
     /**
-     * Request item statistics grouped by day or as one period total.
+     * Дневная статистика объявлений.
+     *
+     * POST /stats/v1/accounts/{user_id}/items.
+     * Без списка fields Авито отдаёт только uniqViews и uniqContacts,
+     * поэтому избранное и просмотры нужно запрашивать явно.
+     * Допустимые поля: views, contacts, favorites, uniqViews, uniqContacts, uniqFavorites.
+     * grouping=totals суммирует дни в одну строку для просмотра периода.
      *
      * @param list<int> $itemIds
      * @return list<array<string, mixed>>
@@ -80,16 +86,54 @@ final class AvitoAPIClient implements AutoloadIdProvider
             return [];
         }
 
+        $allowed = ['views', 'uniqViews', 'contacts', 'uniqContacts', 'favorites', 'uniqFavorites'];
+        $fields = array_values(array_intersect(
+            $this->config['stats_fields'] ?? $allowed,
+            $allowed
+        ));
+        if ($fields === []) {
+            $fields = $allowed;
+        }
+
+        $periodGrouping = match ($grouping) {
+            'week' => 'week',
+            'month' => 'month',
+            default => 'day',
+        };
+
         $payload = [
             'itemIds' => array_values($itemIds),
             'dateFrom' => $dateFrom,
             'dateTo' => $dateTo,
-            'grouping' => $grouping,
+            'fields' => $fields,
+            'periodGrouping' => $periodGrouping,
         ];
 
         $response = $this->requestJson('POST', sprintf('/stats/v1/accounts/%s/items', rawurlencode($this->userId)), $payload);
+        $items = $response['result']['items'] ?? $response['items'] ?? [];
 
-        return $response['result']['items'] ?? $response['items'] ?? [];
+        if ($grouping !== 'totals') {
+            return $items;
+        }
+
+        foreach ($items as &$item) {
+            $sum = ['date' => $dateFrom];
+            foreach ($item['stats'] ?? [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                foreach ($row as $key => $value) {
+                    if ($key === 'date' || !is_numeric($value)) {
+                        continue;
+                    }
+                    $sum[$key] = ($sum[$key] ?? 0) + (int) $value;
+                }
+            }
+            $item['stats'] = [$sum];
+        }
+        unset($item);
+
+        return $items;
     }
 
     /** @param list<int> $itemIds @return list<array<string, mixed>> */
@@ -117,7 +161,7 @@ final class AvitoAPIClient implements AutoloadIdProvider
 
         foreach ($chunks as $chunkIndex => [$chunkFrom, $chunkTo]) {
             $chunkStats = $this->getStatsV2($itemIds, $chunkFrom, $chunkTo, $grouping);
-            $allStats = array_merge($allStats, $chunkStats);
+            $allStats = $this->mergeStatsItems($allStats, $chunkStats);
 
             // Пауза между чанками
             if ($chunkIndex < count($chunks) - 1 && $this->statsRequestDelaySeconds > 0) {
@@ -133,6 +177,41 @@ final class AvitoAPIClient implements AutoloadIdProvider
      *
      * @return list<array{0:string, 1:string}>
      */
+    /**
+     * @param list<array<string, mixed>> $existing
+     * @param list<array<string, mixed>> $chunk
+     * @return list<array<string, mixed>>
+     */
+    private function mergeStatsItems(array $existing, array $chunk): array
+    {
+        $byId = [];
+        foreach ($existing as $item) {
+            $id = (string) ($item['itemId'] ?? '');
+            if ($id !== '') {
+                $byId[$id] = $item;
+            }
+        }
+
+        foreach ($chunk as $item) {
+            $id = (string) ($item['itemId'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+
+            if (!isset($byId[$id])) {
+                $byId[$id] = $item;
+                continue;
+            }
+
+            $byId[$id]['stats'] = array_merge(
+                $byId[$id]['stats'] ?? [],
+                $item['stats'] ?? []
+            );
+        }
+
+        return array_values($byId);
+    }
+
     public static function splitPeriodIntoMonths(string $dateFrom, string $dateTo): array
     {
         $chunks = [];
@@ -173,6 +252,7 @@ final class AvitoAPIClient implements AutoloadIdProvider
      */
     public function getAllItems(array $statuses = ['active'], int $perPage = 100, ?callable $onPage = null): array
     {
+        $perPage = max(1, min(99, $perPage));
         $all = [];
         $page = 1;
         $totalFetched = 0;
@@ -282,6 +362,146 @@ final class AvitoAPIClient implements AutoloadIdProvider
         } catch (\Throwable $e) {
             return null;
         }
+    }
+
+    /**
+     * Последняя успешная выгрузка автозагрузки.
+     *
+     * GET /autoload/v4/uploads/last_successful
+     *
+     * @return array<string, mixed>
+     */
+    public function getLastSuccessfulUpload(): array
+    {
+        return $this->requestJson('GET', '/autoload/v4/uploads/last_successful');
+    }
+
+    /**
+     * Список выгрузок, свежие первыми.
+     *
+     * GET /autoload/v4/uploads
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function getUploads(int $perPage = 10): array
+    {
+        $response = $this->requestJson('GET', '/autoload/v4/uploads', ['per_page' => $perPage]);
+
+        return $response['uploads'] ?? [];
+    }
+
+    /**
+     * Самая свежая выгрузка, у которой есть ссылка на файл.
+     *
+     * last_successful иногда отдаёт не последнюю выгрузку, поэтому берём
+     * список и выбираем первую запись со ссылкой.
+     *
+     * @return array{upload_id: string, status: string, started_at: string, feed_urls: list<array{name: string, url: string}>}|null
+     */
+    public function getLatestUploadWithFeed(): ?array
+    {
+        $candidates = $this->getUploads(10);
+
+        $last = $this->getLastSuccessfulUpload();
+        if ($last !== []) {
+            $candidates[] = $last;
+        }
+
+        foreach ($candidates as $upload) {
+            if (!is_array($upload)) {
+                continue;
+            }
+
+            $urls = [];
+            foreach ($upload['feed_urls'] ?? [] as $entry) {
+                if (!is_array($entry)) {
+                    continue;
+                }
+                $url = trim((string) ($entry['url'] ?? ''));
+                if ($url === '') {
+                    continue;
+                }
+                $urls[] = [
+                    'name' => trim((string) ($entry['name'] ?? '')),
+                    'url' => $url,
+                ];
+            }
+
+            if ($urls === []) {
+                continue;
+            }
+
+            return [
+                'upload_id' => (string) ($upload['upload_id'] ?? $upload['report_id'] ?? ''),
+                'status' => (string) ($upload['status'] ?? ''),
+                'started_at' => (string) ($upload['started_at'] ?? ''),
+                'feed_urls' => $urls,
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * Скачать содержимое фида по ссылке из отчёта автозагрузки.
+     *
+     * @return array{path: string, bytes: int, filename: string, content_type: string}
+     */
+    public function downloadFeedContent(string $url, string $targetDir): array
+    {
+        if (!is_dir($targetDir) && !mkdir($targetDir, 0755, true) && !is_dir($targetDir)) {
+            throw new \RuntimeException("Не удалось создать каталог: {$targetDir}");
+        }
+
+        $request = $this->provider->getAuthenticatedRequest('GET', $url, $this->getToken(), [
+            'headers' => ['Accept' => '*/*'],
+            'timeout' => $this->requestTimeout,
+        ]);
+        $response = $this->provider->getResponse($request);
+
+        $status = $response->getStatusCode();
+        if ($status >= 400) {
+            throw new \RuntimeException(sprintf('Скачивание фида: HTTP %d', $status));
+        }
+
+        $contentType = $response->getHeaderLine('Content-Type');
+        $filename = $this->filenameFromResponse($response, $contentType);
+        $path = rtrim($targetDir, '/\\') . DIRECTORY_SEPARATOR . $filename;
+
+        $body = (string) $response->getBody();
+        if (file_put_contents($path, $body) === false) {
+            throw new \RuntimeException("Не удалось записать файл фида: {$path}");
+        }
+
+        return [
+            'path' => $path,
+            'bytes' => strlen($body),
+            'filename' => $filename,
+            'content_type' => $contentType,
+        ];
+    }
+
+    private function filenameFromResponse(ResponseInterface $response, string $contentType): string
+    {
+        $disposition = $response->getHeaderLine('Content-Disposition');
+        if ($disposition !== '' && preg_match('/filename\*?="?([^";]+)"?/i', $disposition, $m)) {
+            $name = basename(trim($m[1]));
+            $name = preg_replace('/[^\p{L}\p{N}._ -]+/u', '_', $name) ?? '';
+            if ($name !== '') {
+                return date('Y-m-d_His') . '_' . $name;
+            }
+        }
+
+        $extension = 'bin';
+        if (stripos($contentType, 'spreadsheetml') !== false) {
+            $extension = 'xlsx';
+        } elseif (stripos($contentType, 'csv') !== false || stripos($contentType, 'text/plain') !== false) {
+            $extension = 'csv';
+        } elseif (stripos($contentType, 'xml') !== false) {
+            $extension = 'xml';
+        }
+
+        return sprintf('autoload_feed_%s.%s', date('Y-m-d_His'), $extension);
     }
 
     /**
