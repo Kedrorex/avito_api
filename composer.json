@@ -1,6 +1,7 @@
 {
     "name": "avito/republisher",
     "description": "Avito Republisher - переопубликователь объявлений Avito",
+    "license": "proprietary",
     "type": "project",
     "require": {
         "php": ">=8.1",

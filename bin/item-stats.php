@@ -7,7 +7,7 @@ use App\Services\AvitoAPIClient;
 
 $root = dirname(__DIR__);
 if (!is_file($root . '/vendor/autoload.php')) {
-    fwrite(STDERR, "Dependencies are not installed. Run: php composer.phar install\n");
+    fwrite(STDERR, "Dependencies are not installed. Run: composer install\n");
     exit(1);
 }
 require $root . '/vendor/autoload.php';

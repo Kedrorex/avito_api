@@ -3,7 +3,13 @@
 /data/*.db-shm
 /data/*.db-wal
 /data/backups/*.db
+/data/accounts/
+/data/control.db
+/data/control.db-shm
+/data/control.db-wal
+/data/schedule/
 /.env
+/config/accounts/*.env
 /.vscode/
 /swager_avito/
 /tests/

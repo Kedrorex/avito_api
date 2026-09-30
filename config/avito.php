@@ -93,8 +93,14 @@ return [
         'company_name'          => '',                 // Название компании
         'email'                 => '',                 // Почта
 
-        // Источник данных для AutoLoad (импорт из CSV)
-        'autoload_source'       => __DIR__ . '/../fid/Основная база.csv',
+        // Адрес файла на Диске берётся из .env кабинета (YANDEX_DISK_PUBLIC_URL).
+        // Команда disk-url меняет эту строку. В коде адреса нет.
+        'env_file'               => dirname(__DIR__) . '/.env',
+        'yandex_disk_client_id'     => (string) env('YANDEX_DISK_CLIENT_ID', ''),
+        'yandex_disk_client_secret' => (string) env('YANDEX_DISK_CLIENT_SECRET', ''),
+        'yandex_disk_token'         => (string) env('YANDEX_DISK_TOKEN', ''),
+        'yandex_disk_public_url'    => (string) env('YANDEX_DISK_PUBLIC_URL', ''),
+        'yandex_disk_path'          => (string) env('YANDEX_DISK_PATH', ''),
     ],
 
     // SQLite database

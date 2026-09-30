@@ -2,7 +2,6 @@
 
 namespace App\Services;
 
-use App\DTO\AnalysisRuleDTO;
 use App\Repositories\ItemRepository;
 
 /**
@@ -81,16 +80,23 @@ class RepublisherService
             // Сохраняем статистику в БД с транзакцией и обработкой ошибок
             $savedCount = 0;
             $failedCount = 0;
+            $emptyStats = 0;
+            $unmatched = 0;
             $this->repository->beginWriteTransaction();
             try {
                 foreach ($batch as $ad) {
                     $avitoId = (string) ($ad['avito_id'] ?? '');
+                    if ($avitoId === '' || (int) $avitoId <= 0) {
+                        continue;
+                    }
                     if (!isset($statsByItem[$avitoId])) {
+                        $unmatched++;
                         continue;
                     }
 
                     $itemStats = $statsByItem[$avitoId];
                     if ($itemStats === []) {
+                        $emptyStats++;
                         continue;
                     }
 
@@ -113,7 +119,7 @@ class RepublisherService
             }
 
             echo "  Собрано статистики для " . count($itemIds) . " объявлений: "
-                . count($statsList) . " записей (saved: {$savedCount}, failed: {$failedCount})\n";
+                . count($statsList) . " записей (saved: {$savedCount}, empty: {$emptyStats}, unmatched: {$unmatched}, failed: {$failedCount})\n";
         }
     }
 
@@ -140,7 +146,13 @@ class RepublisherService
                 echo "  List page {$page}: {$loaded}/{$totalLabel} ads loaded\n";
             }
         );
-        $sync = $this->repository->syncFromApi($items);
+        $missingIds = $this->repository->filterUnknownAvitoIds(array_map(
+            static fn(array $item): string => trim((string) ($item['id'] ?? '')),
+            $items
+        ));
+        $autoloadIds = (new AutoloadIdSyncService($this->apiClient, $this->repository, $this->config))
+            ->mapAdIds($missingIds);
+        $sync = $this->repository->syncFromApi($items, $autoloadIds);
         $dateTo = date('Y-m-d', strtotime('-1 day'));
         $dateFrom = date('Y-m-d', strtotime("-{$days} days"));
         $delaySeconds = (int) ($this->config['stats_request_delay_seconds'] ?? 8);
@@ -292,36 +304,39 @@ class RepublisherService
             }
         }
 
-        // Обновляем статус
-        $this->repository->updatePhysical((int) $ad['id'], [
-            'status' => 'deactivated',
-            'deactivated_at' => date('Y-m-d H:i:s'),
-        ]);
-
-        // 2. Создаём новое поколение — копируем все поля из старого
+        // 2. Сначала новое поколение, затем старое уходит в архив.
         $masterData = $ad['master_data'] ? json_decode($ad['master_data'], true) : [];
-        $newId = $this->repository->createPhysical(
-            $ad['logical_key'],
-            $masterData,
-            'active'
-        );
+        $this->repository->beginWriteTransaction();
+        try {
+            $newId = $this->repository->createPhysical(
+                $ad['logical_key'],
+                $masterData,
+                'active'
+            );
 
-        // Копируем все feed-колонки из старого объявления
-        $this->repository->updatePhysical($newId, [
-            'published_at' => date('Y-m-d H:i:s'),
-            'old_avito_id' => $avitoId ?: null,
-            'unique_id' => $ad['unique_id'] ?? null,
-            'phone' => $ad['phone'] ?? null,
-            'contact_method' => $ad['contact_method'] ?? null,
-            'brand' => $ad['brand'] ?? null,
-            'oem_number' => $ad['oem_number'] ?? null,
-            'images' => $ad['images'] ?? null,
-            'title' => $ad['title'] ?? null,
-            'description' => $ad['description'] ?? null,
-            'location' => $ad['location'] ?? null,
-            'price' => $ad['price'] ?? 0,
-            'category_params' => $ad['category_params'] ?? null,
-        ]);
+            $this->repository->updatePhysical($newId, [
+                'published_at' => date('Y-m-d H:i:s'),
+                'old_avito_id' => $avitoId ?: null,
+                'unique_id' => $ad['unique_id'] ?? null,
+                'phone' => $ad['phone'] ?? null,
+                'contact_method' => $ad['contact_method'] ?? null,
+                'brand' => $ad['brand'] ?? null,
+                'oem_number' => $ad['oem_number'] ?? null,
+                'images' => $ad['images'] ?? null,
+                'title' => $ad['title'] ?? null,
+                'description' => $ad['description'] ?? null,
+                'location' => $ad['location'] ?? null,
+                'price' => $ad['price'] ?? 0,
+                'category_params' => $ad['category_params'] ?? null,
+            ]);
+            if (!$this->repository->archivePhysicalAd((int) $ad['id'], true)) {
+                throw new \RuntimeException('Не удалось архивировать объявление ' . (int) $ad['id']);
+            }
+            $this->repository->commit();
+        } catch (\Throwable $e) {
+            $this->repository->rollBack();
+            throw $e;
+        }
 
         $newDailyCount = $dailyCount + 1;
         echo "  [REPUB] {$avitoId} -> новое поколение #{$newId} "
@@ -444,6 +459,7 @@ class RepublisherService
         $found = count($candidates);
         $added = 0;
         $skipped = 0;
+        $waitingForAvitoId = 0;
 
         foreach ($candidates as $candidate) {
             $physicalAdId = (int) $candidate['id'];
@@ -451,6 +467,7 @@ class RepublisherService
             $logicalKey = (string) ($candidate['logical_key'] ?? '');
 
             if ($avitoId === '') {
+                $waitingForAvitoId++;
                 continue;
             }
 
@@ -466,6 +483,9 @@ class RepublisherService
         echo "  Found: {$found}\n";
         echo "  Added to candidates: {$added}\n";
         echo "  Skipped (already): {$skipped}\n";
+        if ($waitingForAvitoId > 0) {
+            echo "  Без номера Авито, в очередь не ставятся: {$waitingForAvitoId}\n";
+        }
 
         return [
             'found' => $found,

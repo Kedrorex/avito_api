@@ -281,7 +281,6 @@ final class AvitoAPIClient implements AutoloadIdProvider
 
             $page++;
             // GET /core/v1/items ограничен 25 запросами в минуту.
-            // Используем ту же консервативную паузу, что и проверочный test_item.php.
             sleep($this->listRequestDelaySeconds);
         } while (true);
 

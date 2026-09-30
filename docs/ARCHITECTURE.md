@@ -1,103 +1,65 @@
-# Обзор проекта
+# Как устроен проект
 
-## Назначение
+Код ведёт один кабинет Авито: забирает активные объявления и статистику, копит очередь слабых объявлений и пишет XML для автозагрузки. Готовый файл `run` перезаписывает на Яндекс.Диске. Авито забирает его по публичной ссылке.
 
-Проект получает объявления аккаунта Avito и их статистику: просмотры, уникальные просмотры, контакты, уникальные контакты, добавления в избранное и уникальные добавления. Долгосрочная цель кода — на основе накопленной статистики находить слабые объявления и переопубликовывать их.
+Дополнительные кабинеты изолированы файлами: свой `.env`, свой `avito.db`, свой каталог фида. Общая схема описана в [SCALING.md](SCALING.md). Команды и первый запуск — в [README.md](../README.md).
 
-Проверенный сценарий `test_item.php` получает список активных объявлений и статистику каждого выбранного объявления за 30 завершённых дней. Для рабочего импорта в SQLite добавлена команда `php index.php collect-stats [days]`.
+## Точка входа
 
-## Точка входа и запуск
+`index.php` в консоли открывает один контур и передаёт команду дальше.
 
-| Команда / файл | Роль | Текущий статус |
-| --- | --- | --- |
-| `php test_item.php [N]` | Получает все активные объявления, выбирает первые `N` (по умолчанию 10), запрашивает дневную статистику и выводит сводку. | Рабочий проверочный сценарий |
-| `php bin/item-stats.php` | Интерактивная статистика одного объявления за 30 дней. | Отдельный CLI-сценарий |
-| `php index.php collect-stats [days]` | Синхронизирует объявления статусов `active`, `removed`, `old`, `blocked`, `rejected` и сохраняет их дневную статистику за период 1–270 дней. | Рабочий импорт в SQLite |
-| `php index.php ad <id>` | Показывает локальное объявление и сохранённую по дням статистику, не обращаясь к API. | Рабочий просмотр SQLite |
-| `php index.php <команда>` | Основной CLI: `run`, `sync`, `active`, `stats`, `item`, `republish` и команды выше. | Часть старого пайплайна требует доработки |
-| `index.php` в HTTP-режиме | Slim-маршруты из `routes/api.php`. | Контейнер зависимостей для контроллера не настроен |
-
-Для доступа к API требуются переменные `AVITO_CLIENT_ID`, `AVITO_CLIENT_SECRET` и `AVITO_USER_ID` в `.env`. Файл не должен попадать в репозиторий.
-
-## Поток проверенного сценария
-
-```text
-.env + config/avito.php
-          │
-          ▼
-AvitoAPIClient → OAuth client_credentials → Avito API
-          │
-          ├── GET /core/v1/items        (активные объявления)
-          └── POST /stats/v1/accounts/{userId}/items
-                                            (дневная статистика)
-          ▼
-test_item.php → консольная сводка
-```
-
-`AvitoAPIClient` сохраняет OAuth-токен в памяти объекта и обновляет его при истечении. Универсальный приватный метод `requestJson()` добавляет заголовки и декодирует JSON-ответы.
-
-## Структура кода
-
-| Путь | Ответственность |
+| Команда | Куда попадает |
 | --- | --- |
-| `src/Services/AvitoAPIClient.php` | Авторизация и вызовы Avito API: список объявлений, данные одного объявления, статистика, поиск и пагинация. |
-| `test_item.php` | Проверенный скрипт пакетного получения статистики; в нём находятся паузы 8 и 10 секунд между запросами. |
-| `src/Repositories/ItemRepository.php` | Единственный слой доступа к SQLite. Создаёт таблицы и содержит чтение/запись объявлений и дневной статистики. |
-| `src/Services/RepublisherService.php` | Черновой бизнес-процесс: собрать статистику, найти кандидатов, переопубликовать. |
-| `src/Controllers/AvitoController.php` | Тонкий слой CLI/HTTP поверх сервисов и репозитория. |
-| `config/avito.php` | Учётные данные (из `.env`), лимиты, настройки статистики и DSN SQLite. |
-| `data/avito.db` | Локальный файл SQLite. |
-| `src/DTO/` | Объекты-представления объявления и дневной статистики; сейчас применяются ограниченно. |
+| `php index.php <команда>` | [AccountRuntime::openLegacy](../src/Accounts/AccountRuntime.php): корневой `.env`, `data/avito.db`, `fid/` |
+| `php index.php account <code> <команда>` | [AccountCli](../src/Accounts/AccountCli.php) и реестр [AccountRegistry](../src/Accounts/AccountRegistry.php) |
+| `php index.php accounts <команда>` | Те же команды по всем включённым кабинетам, по очереди |
+| `php index.php schedule` | [RunScheduler](../src/Cli/RunScheduler.php) ждёт `RUN_AT` и вызывает тот же цикл, что `run` |
 
-## SQLite-модель
+Разбор команд одного уже открытого контура — [CommandDispatcher](../src/Cli/CommandDispatcher.php). Пока цикл пишет в базу, [RunLock](../src/Cli/RunLock.php) не пускает второй процесс на тот же файл.
 
-В базе две прикладные таблицы.
+Маршруты Slim в [routes/api.php](../routes/api.php) подключаются, но контроллер для HTTP не собирается: рабочий запуск — консоль.
 
-```text
-physical_ads (одно физическое поколение объявления)
-    id ───────────────────────────────┐
-                                    1 │
-                                      │ N
-stats (показатели одного объявления за дату)
-    physical_ad_id ───────────────────┘
-```
+## Дневной цикл `run`
 
-- `physical_ads` хранит локальный идентификатор, ID Avito, статус, даты публикации/деактивации и исходные данные в JSON (`master_data`).
-- `stats` хранит по одной строке на объявление и дату. Ограничение `UNIQUE(physical_ad_id, date)` позволяет безопасно обновлять повторно запрошенные дни.
+[AvitoController::run](../src/Controllers/AvitoController.php) делает одно и то же для корневого кабинета и для `account {code} run`:
 
-Полный состав полей и примеры SQL приведены в [SQLITE.md](SQLITE.md).
+1. Синхронизация активных объявлений кабинета в `physical_ads`. Снятых в каталоге нет: копия уходит в `deleted_ads`.
+2. Импорт последней выгрузки Автозагрузки: описание, фото, производитель, OEM. Затем дописываются пустые `unique_id`.
+3. Статистика за `stats_days` (по умолчанию 3) в месячные таблицы `statistics_YYYY_MM`.
+4. Очередь слабых объявлений в `republish_candidates_YYYY_MM`. В дневном цикле окно — 4 дня.
+5. XML каталога `active` и `low_perf`. Команда `run` в файл замену `Id` не пишет: очередь только пополняется.
+6. Если это `run`, файл перезаписывается на Яндекс.Диске. `run-r` оставляет его в `fid/`.
 
-## Импорт статистики
+Боевая замена `Id` — отдельные команды `feed` и `republish-feeds`. Они берут порцию очереди, не больше `max_daily_repub` (70) с учётом счётчика дня `app_meta.feed_repub_YYYY-MM-DD`. Старый `Id` в файл не попадает, новое поколение пишется без `AvitoId`. Заголовок, абзацы и порядок фото слегка меняет [AdContentVariation](../src/Services/AdContentVariation.php).
 
-`collect-stats` выполняет следующий поток: получает объявления всех статусов, допустимых для `/core/v1/items` в текущем Swagger (`active`, `removed`, `old`, `blocked`, `rejected`) → создаёт или обновляет `physical_ads` с `avito_id` → запрашивает статистику пакетами максимум по 200 объявлений → сохраняет каждый пакет в одной транзакции. Список объявлений запрашивается по 99 на страницу: API отклоняет `per_page` от 100.
+`republish` и `republish-all` снимают объявление запросом к API, это не файл автозагрузки. Снятие делает [RepublisherService](../src/Services/RepublisherService.php) через `AvitoAPIClient::deactivateItem()`.
 
-Запрос явно передаёт `fields` (`views`, `contacts`, `favorites` и уникальные пары) и `periodGrouping=day`. Без `fields` Авито возвращает только `uniqViews` и `uniqContacts`, и избранное в базе остаётся нулём. Число в кабинете — сумма за выбранный там период, часто за всё время объявления. В базе лежит сумма сохранённых дней; сегодня в запрос не входит. Уже записанные дни с нулевым избранным обновятся только после повторного `collect-stats`.
+## Кто за что отвечает
 
-```powershell
-php index.php collect-stats      # 30 завершённых дней
-php index.php collect-stats 7    # 7 завершённых дней
-php index.php ad 1234567890      # локальный ID или ID Avito
-```
+| Путь | Роль |
+| --- | --- |
+| [src/Services/AvitoAPIClient.php](../src/Services/AvitoAPIClient.php) | OAuth и вызовы API: список объявлений, карточка, статистика, отчёты автозагрузки, снятие. |
+| [src/Repositories/ItemRepository.php](../src/Repositories/ItemRepository.php) | Единственный доступ к SQLite одного кабинета. Создаёт таблицы при открытии. |
+| [src/Services/FeedGeneratorService.php](../src/Services/FeedGeneratorService.php) | Сборка XML из каталога и очереди. |
+| [src/Services/RepublishFeedService.php](../src/Services/RepublishFeedService.php) | Порция замены `Id` с учётом дневного лимита. |
+| [src/Services/AutoloadFeedImportService.php](../src/Services/AutoloadFeedImportService.php) | Разбор выгрузки Автозагрузки в поля объявления. |
+| [src/Services/AutoloadIdSyncService.php](../src/Services/AutoloadIdSyncService.php) | Дописывает пустые Id автозагрузки. |
+| [src/Services/AnalysisService.php](../src/Services/AnalysisService.php) | Правила из `analysis_thresholds` в [config/avito.php](../config/avito.php). |
+| [src/Services/YandexDiskFeedUploader.php](../src/Services/YandexDiskFeedUploader.php) | Перезапись уже опубликованного файла. Токен и ссылка берутся из env открытого кабинета. |
+| [src/Accounts/AccountRuntime.php](../src/Accounts/AccountRuntime.php) | На один прогон собирает клиент, PDO, репозиторий и контроллер и закрывает соединение. |
+| [config/avito.php](../config/avito.php) | Общие паузы, лимиты, пороги и каталог фида. Ключи API для корневого запуска читаются из `.env`. |
 
-Повторный импорт периода обновляет строки с той же парой `(physical_ad_id, date)`. Между страницами списка действует 8-секундная пауза, между запросами статистики — 10-секундная, как в проверенном `test_item.php`. Перед первым массовым запуском рекомендуется начать с периода в 1–3 дня и сверить суммы с `test_item.php`.
+Паузы между запросами списка и статистики — 8 секунд, из `config/avito.php`. Токен OAuth живёт в объекте клиента одного прогона и к следующему кабинету не переходит.
 
-## Известные ограничения до начала автоматизации
-
-Это результаты статического просмотра кода, а не изменения поведения.
-
-- `test_item.php` намеренно не использует `ItemRepository` и не пишет в SQLite: это диагностический сценарий для сравнения результатов импорта.
-- В части старых тестов и контроллера `listItems()` вызывается строкой `'active'`, хотя текущая сигнатура принимает массив статусов (`['active']`). Рабочий `test_item.php` использует массив правильно.
-- `RepublisherService::republish()` обращается к `deactivateItem()`, которого сейчас нет в `AvitoAPIClient`. Переопубликацию нельзя запускать до реализации и проверки этого метода.
-- `maps.md` описывает более раннюю версию API-клиента: названия методов, URL и номера строк частично устарели. Источник истины — текущий код и Swagger-файлы в `swager_avito/`.
-
-## Проверки без обращения к Avito API
+## Проверки без API
 
 ```powershell
-# Проверка синтаксиса ключевых PHP-файлов
-php -l test_item.php
-php -l src/Services/AvitoAPIClient.php
-php -l src/Repositories/ItemRepository.php
-
-# Убедиться, что поддержка SQLite включена
-php -m | Select-String 'pdo_sqlite|sqlite'
+php scripts/test_account_isolation.php
+php scripts/test_autoload_id_service.php
+php scripts/test_autoload_id_sync.php
+php scripts/test_feed_unique_id.php
+php scripts/test_run_schedule.php
+php scripts/test_yandex_disk_upload.php
 ```
+
+Они не ходят в Авито и не меняют рабочую базу. Схема таблиц — в [SQLITE.md](SQLITE.md).

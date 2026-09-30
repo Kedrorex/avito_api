@@ -10,6 +10,7 @@ use App\Services\AvitoAPIClient;
 use App\Services\FeedGeneratorService;
 use App\Services\RepublishFeedService;
 use App\Services\RepublisherService;
+use App\Services\YandexDiskFeedUploader;
 use PDO;
 
 /**
@@ -23,6 +24,7 @@ class AvitoController
     private RepublisherService $republisher;
     private PDO $pdo;
     private array $config;
+    private bool $cloudPublished = true;
 
     public function __construct(
         AvitoAPIClient $apiClient,
@@ -44,30 +46,49 @@ class AvitoController
      */
     public function run(): void
     {
-        $this->executePipeline(false);
+        $this->executePipeline(false, 0, true);
+    }
+
+    /**
+     * Тот же дневной цикл, что run, но XML остаётся в локальной папке.
+     * Опубликованный файл на Яндекс.Диске не перезаписывается.
+     */
+    public function runLocal(): void
+    {
+        $this->executePipeline(false, 0, false);
+    }
+
+    public function cloudPublished(): bool
+    {
+        return $this->cloudPublished;
     }
 
     /**
      * Тот же цикл, что run, но фид для проверки на Авито.
      *
-     * Блок снятия пишется даже если дневной лимит уже занят.
-     * Очередь кандидатов и счётчик дня не меняются.
+     * Замена пишется в файл даже если дневной лимит уже занят.
+     * Очередь кандидатов, счётчик дня и строки объявлений не меняются.
      *
-     * @param int $forcedRemoval Если больше 0 — столько первых объявлений каталога в блок снятия, без поиска кандидатов
+     * @param int $forcedRemoval Если больше 0 — столько первых объявлений каталога заменить в файле, без поиска кандидатов
      */
     public function runTest(int $forcedRemoval = 0): void
     {
         $this->executePipeline(true, $forcedRemoval);
     }
 
-    private function executePipeline(bool $keepQueue, int $forcedRemoval = 0): void
+    private function executePipeline(bool $keepQueue, int $forcedRemoval = 0, bool $upload = false): void
     {
+        $this->cloudPublished = true;
         echo str_repeat('=', 60) . "\n";
-        echo $forcedRemoval > 0
-            ? "  Avito Republisher -- Test feed ({$forcedRemoval} на снятие без кандидатов)\n"
-            : ($keepQueue
-                ? "  Avito Republisher -- Test feed (очередь не списывается)\n"
-                : "  Avito Republisher -- Start\n");
+        if ($forcedRemoval > 0) {
+            echo "  Avito Republisher -- Test feed ({$forcedRemoval} с новым Id, база не меняется)\n";
+        } elseif ($keepQueue) {
+            echo "  Avito Republisher -- Test feed (очередь и новые поколения не пишутся)\n";
+        } elseif ($upload) {
+            echo "  Avito Republisher -- Start, фид уйдёт на Яндекс.Диск\n";
+        } else {
+            echo "  Avito Republisher -- локальный фид, Диск не меняется\n";
+        }
         echo str_repeat('=', 60) . "\n";
         flush();
 
@@ -78,17 +99,29 @@ class AvitoController
             echo "    Fetched {$fetched} items (page {$page})...\n";
             flush();
         });
-        $syncResult = $this->repository->syncFromApi($items);
+        $syncResult = $this->repository->syncFromApi($items, $this->autoloadIdsForUnstoredItems($items));
         $restored = $this->repository->restoreLowPerfStatus();
         $active = $this->repository->getActive();
         
+        echo "  В кабинете активных: " . count($items) . "\n";
         echo "  Создано новых: " . $syncResult['created'] . "\n";
+        echo "  Возвращено из архива: " . ($syncResult['restored'] ?? 0) . "\n";
         echo "  Обновлено: " . $syncResult['updated'] . "\n";
-        echo "  Удалено (снято с публикации): " . $syncResult['removed'] . "\n";
+        echo "  Убрано из каталога, их нет в кабинете: " . $syncResult['removed'] . "\n";
+        if (!empty($syncResult['removed_local'])) {
+            echo "  Из них без номера Авито: " . $syncResult['removed_local'] . "\n";
+        }
         if (!empty($syncResult['removed_ids'])) {
-            echo "  Удалённые avito_id: " . implode(', ', $syncResult['removed_ids']) . "\n";
+            echo "  Номера, которых больше нет в кабинете: " . implode(', ', $syncResult['removed_ids']) . "\n";
+        }
+        $keptIds = $syncResult['kept_ids'] ?? [];
+        if ($keptIds !== []) {
+            echo "  Номер уже записан на другом объявлении: " . count($keptIds) . "\n";
         }
         echo "  Active ads в БД: " . count($active) . "\n";
+        if (count($active) !== count($items)) {
+            echo "  [WARN] Каталог и активные объявления кабинета не совпали\n";
+        }
         if ($restored > 0) {
             echo "  Возвращено из low_perf: {$restored}\n";
         }
@@ -100,6 +133,7 @@ class AvitoController
 
         $this->importFeedFromApi(false);
         $this->syncUniqueIds(false);
+        $this->fillMissingBrandOem();
 
         // 2. Сбор статистики
         echo "\n  --- Collect Stats ---\n";
@@ -110,7 +144,7 @@ class AvitoController
         $candidateResult = ['found' => 0, 'added' => 0, 'skipped' => 0];
         if ($forcedRemoval > 0) {
             echo "\n  --- Find Candidates ---\n";
-            echo "  Пропуск: тест берёт {$forcedRemoval} объявлений каталога без очереди\n";
+            echo "  Пропуск: тест заменяет {$forcedRemoval} объявлений каталога без очереди\n";
         } else {
             // 3. Поиск кандидатов (запись в republish_candidates_*)
             echo "\n  --- Find Candidates ---\n";
@@ -125,17 +159,26 @@ class AvitoController
         echo "\n  --- Generate Feed ---\n";
         flush();
         $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config);
-        $feedResult = $feedGenerator->generate(false, $keepQueue, $forcedRemoval);
+        $catalogOnly = $forcedRemoval === 0 && !$keepQueue;
+        $feedResult = $feedGenerator->generate(false, $keepQueue, $forcedRemoval, $catalogOnly);
         if ($feedResult['count'] > 0) {
             echo "  Фид XML: {$feedResult['file']} ({$feedResult['count']} объявлений)\n";
             if (!empty($feedResult['csv_file'])) {
                 echo "  Фид CSV: {$feedResult['csv_file']}\n";
             }
         }
+        if (!$keepQueue && $forcedRemoval === 0 && ($feedResult['file'] ?? '') !== '') {
+            if ($upload) {
+                $this->cloudPublished = $this->publishFeedFile((string) $feedResult['file']);
+            } else {
+                echo "  Локально: {$feedResult['file']}\n";
+                echo "  Яндекс.Диск не менялся\n";
+            }
+        }
 
         echo "\n  --- Итог ---\n";
         echo "  Кандидатов добавлено в очередь: " . $candidateResult['added'] . "\n";
-        echo "  В фиде на снятие: " . count($feedResult['candidate_avito_ids'] ?? []) . "\n";
+        echo "  В фиде с новым Id: " . count($feedResult['candidate_avito_ids'] ?? []) . "\n";
         echo "  Объявлений в файле: " . ($feedResult['count'] ?? 0) . "\n";
 
         echo "\n" . str_repeat('=', 60) . "\n";
@@ -214,6 +257,9 @@ class AvitoController
                 echo "  Фид CSV: {$feedResult['csv_file']}\n";
             }
         }
+        if (($feedResult['file'] ?? '') !== '') {
+            $this->publishFeedFile((string) $feedResult['file']);
+        }
 
         echo "\n  --- Итог ---\n";
         echo "  Кандидатов в фиде: " . count($feedResult['candidate_avito_ids'] ?? []) . " (лимит: {$remaining})\n";
@@ -244,7 +290,7 @@ class AvitoController
     public function sync(): string
     {
         $items = $this->apiClient->getAllItems(['active']);
-        $synced = $this->repository->syncFromApi($items);
+        $synced = $this->repository->syncFromApi($items, $this->autoloadIdsForUnstoredItems($items));
         $total = count($this->repository->getActive());
 
         return json_encode([
@@ -796,6 +842,9 @@ class AvitoController
         try {
             $feedGenerator = new FeedGeneratorService($this->repository, $this->apiClient, $this->config);
             $result = $feedGenerator->generate($priorityMode);
+            $cloud = ($result['file'] ?? '') !== ''
+                ? $this->cloudStatus((string) $result['file'], false)
+                : ['configured' => false, 'uploaded' => false];
 
             return json_encode([
                 'status' => 'success',
@@ -805,6 +854,7 @@ class AvitoController
                 'count' => $result['count'] ?? 0,
                 'headers' => $result['headers'] ?? [],
                 'priority_mode' => $priorityMode,
+                'cloud' => $cloud,
             ], JSON_UNESCAPED_UNICODE);
         } catch (\Throwable $e) {
             return json_encode([
@@ -853,7 +903,7 @@ class AvitoController
      * HTTP: POST /republish-feeds с телом {"count": 10}
      * CLI:  php index.php republish-feeds <count>
      *
-     * Формат: сверху снятие порции из очереди, ниже весь каталог, включая кандидатов.
+     * Формат: у порции из очереди старый Id заменён новым, остальной каталог на месте.
      *
      * @param int|null $count Сколько кандидатов снять сверху (не больше 70 и дневного остатка), null для HTTP
      * @param bool $cli Режим CLI (true) или HTTP (false)
@@ -890,10 +940,10 @@ class AvitoController
             echo "\n";
             echo str_repeat('=', 60) . "\n";
             echo "  ГЕНЕРАЦИЯ ФИДА\n";
-            echo "  Сверху — снятие из очереди, ниже — весь каталог, включая кандидатов\n";
+            echo "  У порции из очереди старый Id убран, в файле новый Id. Остальной каталог остаётся\n";
             echo str_repeat('=', 60) . "\n";
             echo "  В очереди:         " . count($candidates) . "\n";
-            echo "  Снять не больше:   {$maxCount}\n";
+            echo "  Заменить не больше: {$maxCount}\n";
             echo str_repeat('=', 60) . "\n\n";
 
             // Показываем первых 5 кандидатов
@@ -922,13 +972,12 @@ class AvitoController
                 if (!empty($result['csv_file'])) {
                     echo "  CSV: {$result['csv_file']}\n";
                 }
-                echo "  Снятие сверху: " . ($result['count'] ?? 0) . "\n";
-                echo "  Каталог ниже:  " . ($result['catalog_count'] ?? 0) . "\n";
+                echo "  Новый Id:          " . ($result['count'] ?? 0) . "\n";
+                echo "  Остальной каталог: " . ($result['catalog_count'] ?? 0) . "\n";
                 echo "  Объявлений:    " . ($result['total_rows'] ?? 0) . "\n";
-                echo "\n  Следующие шаги:\n";
-                echo "    1. Проверить файл в директории fid/\n";
-                echo "    2. Загрузить фид на облако Avito\n";
-                echo "    3. Отправить команду Avito на обновление\n";
+                if (($result['feed_file'] ?? '') !== '') {
+                    $this->publishFeedFile((string) $result['feed_file']);
+                }
             } else {
                 echo "\n  [ERROR] Не удалось сгенерировать фид\n";
             }
@@ -938,6 +987,9 @@ class AvitoController
 
         // HTTP режим
         $result = $feedService->generate($candidates, $maxCount);
+        $cloud = ($result['feed_file'] ?? '') !== ''
+            ? $this->cloudStatus((string) $result['feed_file'], false)
+            : ['configured' => false, 'uploaded' => false];
 
         return json_encode([
             'status' => 'success',
@@ -947,6 +999,7 @@ class AvitoController
             'count' => $result['count'] ?? 0,
             'catalog_count' => $result['catalog_count'] ?? 0,
             'total_rows' => $result['total_rows'] ?? 0,
+            'cloud' => $cloud,
             'candidates' => array_map(function ($ad) {
                 $masterData = json_decode($ad['master_data'] ?? '', true);
                 return [
@@ -957,6 +1010,104 @@ class AvitoController
                 ];
             }, $result['candidates'] ?? []),
         ], JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Перезаписать опубликованный файл кабинета на Яндекс.Диске.
+     * Тестовые фиды сюда не передаются: ссылка Авито должна смотреть на полный каталог.
+     */
+    public function publishFeedFile(string $file): bool
+    {
+        $cloud = $this->cloudStatus($file, true);
+
+        return empty($cloud['configured']) || !empty($cloud['uploaded']);
+    }
+
+    /**
+     * @return array{configured: bool, uploaded: bool, error?: string, public_url?: string, path?: string, name?: string, size?: int}
+     */
+    private function cloudStatus(string $file, bool $cli): array
+    {
+        $uploader = new YandexDiskFeedUploader($this->config);
+        if (!$uploader->isConfigured()) {
+            return ['configured' => false, 'uploaded' => false];
+        }
+
+        if (!$uploader->hasToken()) {
+            $message = 'Ссылка на Яндекс.Диск задана, токена нет. Файл на Диске не обновлён.';
+            if ($cli) {
+                echo "  [WARN] {$message}\n";
+                echo "  Впишите YANDEX_DISK_TOKEN в .env этого кабинета.\n";
+                echo "  Ссылка: {$uploader->publicUrl()}\n";
+            }
+
+            return [
+                'configured' => true,
+                'uploaded' => false,
+                'error' => $message,
+                'public_url' => $uploader->publicUrl(),
+            ];
+        }
+
+        try {
+            $result = $uploader->upload($file);
+            if ($cli) {
+                echo "  Яндекс.Диск: записан {$result['name']}, публичная ссылка та же\n";
+                echo "  {$result['public_url']}\n";
+            }
+
+            return [
+                'configured' => true,
+                'uploaded' => true,
+                'public_url' => $result['public_url'],
+                'path' => $result['path'],
+                'name' => $result['name'],
+                'size' => $result['size'],
+            ];
+        } catch (\Throwable $e) {
+            if ($cli) {
+                echo "  [ERROR] {$e->getMessage()}\n";
+                echo "  Локальный файл: {$file}\n";
+            }
+
+            return [
+                'configured' => true,
+                'uploaded' => false,
+                'error' => $e->getMessage(),
+                'public_url' => $uploader->publicUrl(),
+            ];
+        }
+    }
+
+    /**
+     * Id автозагрузки для номеров, которых ещё нет в базе.
+     * По этому Id новое объявление кабинета привязывается к уже созданному поколению.
+     *
+     * @param list<array<string, mixed>> $items
+     * @return array<string, string>
+     */
+    private function autoloadIdsForUnstoredItems(array $items): array
+    {
+        $ids = [];
+        foreach ($items as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $id = trim((string) ($item['id'] ?? ''));
+            if ($id !== '') {
+                $ids[] = $id;
+            }
+        }
+        $missing = $this->repository->filterUnknownAvitoIds($ids);
+        if ($missing === []) {
+            return [];
+        }
+
+        echo '  Номера Авито без строки в базе: ' . count($missing) . "\n";
+        flush();
+        $sync = new AutoloadIdSyncService($this->apiClient, $this->repository, $this->config['avito']);
+
+        return $sync->mapAdIds($missing);
     }
 
     /**
@@ -987,13 +1138,28 @@ class AvitoController
     }
 
     /**
+     * Пустые производитель и OEM дописать из файла кабинета и сохранить в БД.
+     */
+    public function fillMissingBrandOem(): void
+    {
+        echo "\n  --- Brand / OEM из кабинета ---\n";
+        flush();
+        $service = new AutoloadFeedImportService($this->apiClient, $this->repository, $this->config);
+        $service->fillMissingBrandOem();
+    }
+
+    /**
      * Импорт файла выгрузки с диска: XLSX или CSV.
      */
     public function importFeedFromFile(?string $path = null, bool $dryRun = false): void
     {
-        $feedPath = $path ?? (string) ($this->config['feed']['autoload_source'] ?? '');
+        $feedPath = trim((string) $path);
         echo "\n  --- Import AutoLoad Feed (файл) ---\n";
-        if ($feedPath === '' || !file_exists($feedPath)) {
+        if ($feedPath === '') {
+            echo "  Укажите файл: php index.php import-feed путь\n";
+            return;
+        }
+        if (!file_exists($feedPath)) {
             echo "  Файл не найден: {$feedPath}\n";
             return;
         }

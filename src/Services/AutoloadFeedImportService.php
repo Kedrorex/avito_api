@@ -170,12 +170,79 @@ class AutoloadFeedImportService
     }
 
     /**
+     * Дописать пустые «Производитель» и «Номер детали OEM» из файла кабинета.
+     *
+     * Полный импорт пропускает уже скачанную выгрузку, поэтому новые поколения
+     * и строки, которые не совпали по номеру, остаются без этих полей.
+     * Пишутся только пустые колонки.
+     *
+     * @return array{missing: int, updated: int, still_empty: int}
+     */
+    public function fillMissingBrandOem(): array
+    {
+        $result = ['missing' => 0, 'updated' => 0, 'still_empty' => 0];
+        $ads = $this->repository->listAdsMissingBrandOrOem();
+        $result['missing'] = count($ads);
+        if ($ads === []) {
+            echo "  Производитель и OEM заполнены у всех активных\n";
+            return $result;
+        }
+
+        echo "  Пустой производитель или OEM: {$result['missing']}\n";
+        flush();
+
+        $path = $this->resolveCabinetFeedFile();
+        if ($path === null) {
+            $result['still_empty'] = $result['missing'];
+            return $result;
+        }
+
+        echo "  Производитель и OEM из {$path}\n";
+        flush();
+        $index = $this->brandOemIndex($path);
+        $indexed = max(count($index['by_avito']), count($index['by_unique']));
+        echo "  В файле строк с производителем или OEM: {$indexed}\n";
+
+        $this->repository->beginWriteTransaction();
+        try {
+            foreach ($ads as $ad) {
+                $found = $this->lookupBrandOem($index, $ad);
+                $update = [];
+                if ($this->isBlank($ad['brand'] ?? null) && ($found['brand'] ?? '') !== '') {
+                    $update['brand'] = $found['brand'];
+                }
+                if ($this->isBlank($ad['oem_number'] ?? null) && ($found['oem'] ?? '') !== '') {
+                    $update['oem_number'] = $found['oem'];
+                }
+                if ($update === []) {
+                    $result['still_empty']++;
+                    continue;
+                }
+
+                $this->repository->updatePhysical((int) $ad['id'], $update);
+                $result['updated']++;
+            }
+            $this->repository->commit();
+        } catch (\Throwable $e) {
+            $this->repository->rollBack();
+            throw $e;
+        }
+
+        echo "  Дописано объявлений: {$result['updated']}\n";
+        if ($result['still_empty'] > 0) {
+            echo "  В кабинете нет данных: {$result['still_empty']}\n";
+        }
+
+        return $result;
+    }
+
+    /**
      * Импортировать файл с диска: XLSX или CSV.
      *
      * @param bool $dryRun Только разобрать файл и показать сводку, без записи в БД
      * @return array{status: string, upload_id: string, file: string, rows: int, updated: int, missing: int}
      */
-    public function importFile(string $path, bool $dryRun = false): array
+    public function importFile(string $path, bool $dryRun = false, ?array $onlyColumns = null): array
     {
         $result = [
             'status' => 'ok',
@@ -192,10 +259,7 @@ class AutoloadFeedImportService
             return $result;
         }
 
-        $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
-        $rows = $extension === 'xlsx'
-            ? $this->rowsFromXlsx($path)
-            : $this->rowsFromCsv($path);
+        $rows = $this->collectRows($path);
 
         if ($rows === []) {
             echo "  В файле не найдено строк с номерами объявлений\n";
@@ -213,14 +277,65 @@ class AutoloadFeedImportService
             return $result;
         }
 
-        $applied = $this->repository->updateFeedColumnsByAvitoId($rows, self::ALLOWED_COLUMNS);
+        $allowed = $onlyColumns ?? self::ALLOWED_COLUMNS;
+        $applied = $this->repository->updateFeedColumnsByAvitoId($rows, $allowed);
         $result['updated'] = $applied['updated'];
         $result['missing'] = $applied['missing'];
 
         echo "  Обновлено объявлений: {$applied['updated']}\n";
+        echo "  Поколениям дописаны производитель, OEM, описание и фото: " . ($applied['copied'] ?? 0) . "\n";
         echo "  Нет в БД: {$applied['missing']}\n";
 
         return $result;
+    }
+
+    /**
+     * Описание и ссылки на фото по Id автозагрузки.
+     * HTML описания сохраняется: в фиде он уходит в CDATA как в исходном файле.
+     *
+     * @return array<string, array{description: string, images: string}>
+     */
+    public function listingContentByUniqueId(string $path): array
+    {
+        $index = [];
+        foreach ($this->collectRows($path) as $lookupKey => $columns) {
+            $uniqueId = trim((string) ($columns['unique_id'] ?? ''));
+            if ($uniqueId === '' && !ctype_digit((string) $lookupKey)) {
+                $uniqueId = trim((string) $lookupKey);
+            }
+            if ($uniqueId === '') {
+                continue;
+            }
+
+            $description = trim((string) ($columns['description'] ?? ''));
+            $images = trim((string) ($columns['images'] ?? ''));
+            if ($description === '' && ($images === '' || $images === '[]')) {
+                continue;
+            }
+
+            $index[$uniqueId] = [
+                'description' => $description,
+                'images' => $images,
+            ];
+        }
+
+        return $index;
+    }
+
+    /**
+     * @return array<string, array<string, string|int>>
+     */
+    private function collectRows(string $path): array
+    {
+        $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if ($extension === 'xlsx') {
+            return $this->rowsFromXlsx($path);
+        }
+        if ($this->fileStartsWithAds($path)) {
+            return $this->rowsFromXml($path);
+        }
+
+        return $this->rowsFromCsv($path);
     }
 
     /**
@@ -309,6 +424,127 @@ class AutoloadFeedImportService
     }
 
     /**
+     * Файл отчёта Авито иногда сохранён как .xml, но внутри это CSV.
+     * Настоящий фид начинается с корня Ads.
+     */
+    private function fileStartsWithAds(string $path): bool
+    {
+        $handle = fopen($path, 'r');
+        if ($handle === false) {
+            return false;
+        }
+        $head = (string) fread($handle, 400);
+        fclose($handle);
+        $head = preg_replace('/^\xEF\xBB\xBF/', '', $head) ?? $head;
+
+        return preg_match('/<\?xml[^>]*\?>\s*<Ads\b|<\s*Ads\b/u', $head) === 1;
+    }
+
+    /**
+     * @return array<string, array<string, string|int>>
+     */
+    private function rowsFromXml(string $path): array
+    {
+        $reader = new \XMLReader();
+        if (!$reader->open($path, 'UTF-8')) {
+            return [];
+        }
+
+        $collected = [];
+        while ($reader->read()) {
+            if ($reader->nodeType !== \XMLReader::ELEMENT || $reader->name !== 'Ad') {
+                continue;
+            }
+            $outer = $reader->readOuterXml();
+            if ($outer === '') {
+                continue;
+            }
+            $ad = simplexml_load_string($outer);
+            if ($ad === false) {
+                continue;
+            }
+
+            $avitoId = trim((string) $ad->AvitoId);
+            $uniqueId = trim((string) $ad->Id);
+            if ($avitoId !== '' && !ctype_digit($avitoId)) {
+                $avitoId = '';
+            }
+            if ($avitoId === '' && $uniqueId === '') {
+                continue;
+            }
+            if ($this->isTemplateHintRow($uniqueId, $avitoId)) {
+                continue;
+            }
+
+            $columns = [];
+            $this->putFeedColumn($columns, 'unique_id', $uniqueId);
+            $this->putFeedColumn($columns, 'phone', (string) $ad->ContactPhone);
+            $this->putFeedColumn($columns, 'contact_method', (string) $ad->ContactMethod);
+            $this->putFeedColumn($columns, 'location', (string) $ad->Address);
+            $this->putFeedColumn($columns, 'description', trim((string) $ad->Description));
+            $this->putFeedColumn($columns, 'title', (string) $ad->Title);
+            $price = preg_replace('/[^0-9]/', '', (string) $ad->Price);
+            if ($price !== '') {
+                $columns['price'] = (int) $price;
+            }
+            $this->putFeedColumn($columns, 'brand', (string) $ad->Brand);
+            $this->putFeedColumn($columns, 'oem_number', (string) $ad->OEM);
+
+            $images = [];
+            foreach ($ad->Images->Image ?? [] as $image) {
+                $url = trim((string) ($image['url'] ?? ''));
+                if ($url !== '') {
+                    $images[] = $url;
+                }
+            }
+            if ($images !== []) {
+                $columns['images'] = json_encode($images, JSON_UNESCAPED_UNICODE);
+            }
+
+            $categoryParams = [];
+            foreach ([
+                'GoodsType' => 'Вид товара',
+                'AdType' => 'Вид объявления',
+                'ProductType' => 'Тип товара',
+                'SparePartType' => 'Вид запчасти',
+                'EngineSparePartType' => 'Тип детали двигателя',
+                'Condition' => 'Состояние',
+                'Originality' => 'Происхождение',
+                'Availability' => 'Доступность',
+            ] as $element => $name) {
+                $value = trim((string) $ad->{$element});
+                if ($value !== '') {
+                    $categoryParams[$name] = $value;
+                }
+            }
+            if ($categoryParams !== []) {
+                $columns['category_params'] = json_encode($categoryParams, JSON_UNESCAPED_UNICODE);
+            }
+
+            if ($columns === []) {
+                continue;
+            }
+
+            $collected[$avitoId !== '' ? $avitoId : $uniqueId] = $columns;
+        }
+
+        $reader->close();
+
+        return $collected;
+    }
+
+    /**
+     * @param array<string, string|int> $columns
+     */
+    private function putFeedColumn(array &$columns, string $column, string $value): void
+    {
+        $value = trim($value);
+        if ($value !== '') {
+            $columns[$column] = $value;
+        }
+    }
+
+    /**
      * @return array<string, array<string, string|int>>
      */
     private function rowsFromCsv(string $path): array
@@ -322,14 +558,11 @@ class AutoloadFeedImportService
         $headers = null;
         $collected = [];
 
-        // Пропускаем BOM, если он есть
-        fseek($handle, 0);
-        if (fread($handle, 3) !== "\xEF\xBB\xBF") {
-            fseek($handle, 0);
-        }
-
-        while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
-            $row = array_map(static fn($v) => trim((string) $v), $row);
+        while (($line = fgets($handle)) !== false) {
+            $row = $this->parseAutoloadCsvLine($line, $delimiter);
+            if ($row === []) {
+                continue;
+            }
 
             if ($headers === null) {
                 $candidate = $this->headerMap($row);
@@ -351,6 +584,33 @@ class AutoloadFeedImportService
         fclose($handle);
 
         return $collected;
+    }
+
+    /**
+     * Строка автозагрузки часто целиком в кавычках и заканчивается на `;;`.
+     *
+     * @return list<string>
+     */
+    private function parseAutoloadCsvLine(string $line, string $delimiter): array
+    {
+        $line = trim($line);
+        if ($line === '') {
+            return [];
+        }
+
+        $line = preg_replace('/^\xEF\xBB\xBF/', '', $line) ?? $line;
+        $line = preg_replace('/;;\s*$/', '', $line) ?? $line;
+        if (str_starts_with($line, '"') && str_ends_with($line, '"')) {
+            $line = str_replace('""', '"', substr($line, 1, -1));
+            $delimiter = ',';
+        }
+
+        $row = str_getcsv($line, $delimiter);
+        if ($row === false) {
+            return [];
+        }
+
+        return array_map(static fn($value): string => trim((string) $value), $row);
     }
 
     private function detectCsvDelimiter(string $path): string
@@ -434,7 +694,7 @@ class AutoloadFeedImportService
             }
 
             $columns[$column] = match ($column) {
-                'description' => trim(strip_tags($value)),
+                'description' => trim($value),
                 'images' => $this->encodeImages($value),
                 'price' => (int) preg_replace('/[^0-9]/', '', $value),
                 default => $value,
@@ -498,6 +758,159 @@ class AutoloadFeedImportService
         }
 
         return round($bytes / 1024) . ' КБ';
+    }
+
+    /**
+     * Файл последней выгрузки кабинета. Если его уже скачали — берём с диска.
+     */
+    private function resolveCabinetFeedFile(): ?string
+    {
+        $local = $this->newestLocalFeed();
+        if ($local !== null) {
+            return $local;
+        }
+
+        try {
+            $upload = $this->apiClient->getLatestUploadWithFeed();
+        } catch (\Throwable $e) {
+            echo "  [ERROR] " . $this->explainError($e) . "\n";
+            return null;
+        }
+
+        if ($upload === null) {
+            echo "  В отчётах Автозагрузки нет ссылки на файл\n";
+            return null;
+        }
+
+        try {
+            $downloaded = $this->apiClient->downloadFeedContent($upload['feed_urls'][0]['url'], $this->downloadDir);
+        } catch (\Throwable $e) {
+            echo "  [ERROR] " . $this->explainError($e) . "\n";
+            return null;
+        }
+
+        echo "  Файл из кабинета: {$downloaded['filename']} (" . $this->formatSize($downloaded['bytes']) . ")\n";
+
+        return $downloaded['path'];
+    }
+
+    private function newestLocalFeed(): ?string
+    {
+        if (!is_dir($this->downloadDir)) {
+            return null;
+        }
+
+        $files = array_merge(
+            glob($this->downloadDir . '/*.xlsx') ?: [],
+            glob($this->downloadDir . '/*.csv') ?: [],
+            glob($this->downloadDir . '/*.xml') ?: []
+        );
+        if ($files === []) {
+            return null;
+        }
+
+        usort($files, static function (string $a, string $b): int {
+            return filemtime($b) <=> filemtime($a);
+        });
+
+        return $files[0];
+    }
+
+    /**
+     * @return array{
+     *     by_avito: array<string, array{brand: string, oem: string}>,
+     *     by_unique: array<string, array{brand: string, oem: string}>
+     * }
+     */
+    private function brandOemIndex(string $path): array
+    {
+        $byAvito = [];
+        $byUnique = [];
+        foreach ($this->collectRows($path) as $lookupKey => $columns) {
+            $entry = [
+                'brand' => trim((string) ($columns['brand'] ?? '')),
+                'oem' => trim((string) ($columns['oem_number'] ?? '')),
+            ];
+            if ($entry['brand'] === '' && $entry['oem'] === '') {
+                continue;
+            }
+
+            $uniqueId = trim((string) ($columns['unique_id'] ?? ''));
+            if ($uniqueId === '' && !ctype_digit((string) $lookupKey)) {
+                $uniqueId = trim((string) $lookupKey);
+            }
+            if (ctype_digit((string) $lookupKey)) {
+                $byAvito[(string) $lookupKey] = $this->mergeBrandOem($byAvito[(string) $lookupKey] ?? null, $entry);
+            }
+            if ($uniqueId !== '') {
+                $byUnique[$uniqueId] = $this->mergeBrandOem($byUnique[$uniqueId] ?? null, $entry);
+            }
+        }
+
+        return ['by_avito' => $byAvito, 'by_unique' => $byUnique];
+    }
+
+    /**
+     * Своё объявление, затем базовый Id без -vN, затем номер предыдущего поколения.
+     *
+     * @param array{
+     *     by_avito: array<string, array{brand: string, oem: string}>,
+     *     by_unique: array<string, array{brand: string, oem: string}>
+     * } $index
+     * @param array<string, mixed> $ad
+     * @return array{brand: string, oem: string}
+     */
+    private function lookupBrandOem(array $index, array $ad): array
+    {
+        $found = ['brand' => '', 'oem' => ''];
+        $avitoId = trim((string) ($ad['avito_id'] ?? ''));
+        $oldAvitoId = trim((string) ($ad['old_avito_id'] ?? ''));
+        $uniqueId = trim((string) ($ad['unique_id'] ?? ''));
+        $baseId = preg_replace('/-v\d+$/', '', $uniqueId) ?? $uniqueId;
+
+        $candidates = [];
+        if ($avitoId !== '' && isset($index['by_avito'][$avitoId])) {
+            $candidates[] = $index['by_avito'][$avitoId];
+        }
+        if ($uniqueId !== '' && isset($index['by_unique'][$uniqueId])) {
+            $candidates[] = $index['by_unique'][$uniqueId];
+        }
+        if ($baseId !== '' && $baseId !== $uniqueId && isset($index['by_unique'][$baseId])) {
+            $candidates[] = $index['by_unique'][$baseId];
+        }
+        if ($oldAvitoId !== '' && isset($index['by_avito'][$oldAvitoId])) {
+            $candidates[] = $index['by_avito'][$oldAvitoId];
+        }
+
+        foreach ($candidates as $candidate) {
+            $found = $this->mergeBrandOem($found, $candidate);
+        }
+
+        return $found;
+    }
+
+    /**
+     * @param array{brand: string, oem: string}|null $current
+     * @param array{brand: string, oem: string} $incoming
+     * @return array{brand: string, oem: string}
+     */
+    private function mergeBrandOem(?array $current, array $incoming): array
+    {
+        $brand = trim((string) ($current['brand'] ?? ''));
+        $oem = trim((string) ($current['oem'] ?? ''));
+        if ($brand === '') {
+            $brand = $incoming['brand'];
+        }
+        if ($oem === '') {
+            $oem = $incoming['oem'];
+        }
+
+        return ['brand' => $brand, 'oem' => $oem];
+    }
+
+    private function isBlank(mixed $value): bool
+    {
+        return trim((string) $value) === '';
     }
 
     private function explainError(\Throwable $e): string

@@ -13,12 +13,11 @@ use App\Services\AvitoAPIClient;
  *
  * Данные читаются из колонок БД physical_ads.
  *
- * Состав файла:
- * 1. Сверху — сегодняшняя порция очереди republish_candidates_* (не больше
- *    max_daily_repub, по умолчанию 70), AvitoStatus=removed.
- * 2. Ниже — весь текущий каталог (active и low_perf), включая тех же
- *    кандидатов, AvitoStatus=active.
- * Кандидаты, не попавшие в порцию, остаются в очереди на следующие дни.
+ * Состав файла — один каталог, AvitoStatus=active:
+ * сегодняшняя порция очереди republish_candidates_* (не больше max_daily_repub,
+ * по умолчанию 70) пишется новым Id. Старого Id в файле нет: Авито снимает
+ * объявление, которого нет в фиде, и публикует новое с нуля.
+ * Кандидаты, не попавшие в порцию, остаются в очереди и в файле со старым Id.
  */
 class FeedGeneratorService
 {
@@ -44,13 +43,13 @@ class FeedGeneratorService
     /**
      * Сгенерировать XML-фид.
      *
-     * @param bool $priorityMode Если true — кандидаты на переопубликовку идут первыми
-     * @param bool $keepQueue Тестовый фид: порция снятия пишется, но очередь и дневной счётчик не меняются
-     * @param int $forcedRemoval Тест: столько первых объявлений каталога в блок снятия, без очереди и без сверки avito_id
+     * @param bool $priorityMode Не используется. Оставлен, чтобы не ломать вызовы.
+     * @param bool $keepQueue Тестовый фид: замена видна в файле, очередь, счётчик и строки БД не меняются
+     * @param int $forcedRemoval Тест: столько первых объявлений каталога заменить в файле, без очереди и без записи в БД
      *
      * @return array{file: string, xml_file: string, csv_file: string, count: int, headers: string[]}
      */
-    public function generate(bool $priorityMode = true, bool $keepQueue = false, int $forcedRemoval = 0): array
+    public function generate(bool $priorityMode = true, bool $keepQueue = false, int $forcedRemoval = 0, bool $catalogOnly = false): array
     {
         $restored = $this->repository->restoreLowPerfStatus();
         if ($restored > 0) {
@@ -73,6 +72,8 @@ class FeedGeneratorService
             ];
         }
 
+        $this->backfillListingContent($catalog);
+
         $catalogByAvitoId = [];
         foreach ($catalog as $ad) {
             $avitoId = (string) ($ad['avito_id'] ?? '');
@@ -81,9 +82,12 @@ class FeedGeneratorService
             }
         }
 
-        if ($forcedRemoval > 0) {
+        if ($catalogOnly) {
+            $removalAds = [];
+            echo "  В файле активные объявления кабинета, очередь на замену не берём\n";
+        } elseif ($forcedRemoval > 0) {
             $removalAds = array_slice(array_values($catalog), 0, $forcedRemoval);
-            echo "  Тест: на снятие первые " . count($removalAds) . " из каталога, без очереди и без сверки avito_id\n";
+            echo "  Тест: заменить первые " . count($removalAds) . " из каталога, без очереди и без сверки avito_id\n";
             foreach ($removalAds as $ad) {
                 echo "    id=" . ($ad['id'] ?? '')
                     . " avito_id=" . ($ad['avito_id'] ?? '')
@@ -93,19 +97,30 @@ class FeedGeneratorService
             $removalAds = $this->selectRemovalBatch($catalogByAvitoId, $keepQueue);
         }
 
-        $ads = [];
+        $persist = !$keepQueue && $forcedRemoval === 0;
+        $replacedIds = [];
+        foreach ($removalAds as $ad) {
+            $id = (int) ($ad['id'] ?? 0);
+            if ($id > 0) {
+                $replacedIds[$id] = true;
+            }
+        }
+
+        $reservedIds = [];
+        $replacements = [];
         $candidateAvitoIds = [];
         foreach ($removalAds as $ad) {
-            $data = $this->buildAdData($ad, 'removed');
-            if ($data === null) {
-                continue;
-            }
-            $ads[] = $data;
+            $replacement = $this->spawnReplacement($ad, $persist, $reservedIds);
+            $replacements[] = $replacement;
             $candidateAvitoIds[] = (string) ($ad['avito_id'] ?? '');
         }
 
+        $ads = [];
         $catalogCount = 0;
         foreach ($catalog as $ad) {
+            if (isset($replacedIds[(int) ($ad['id'] ?? 0)])) {
+                continue;
+            }
             $data = $this->buildAdData($ad, 'active');
             if ($data === null) {
                 continue;
@@ -113,6 +128,19 @@ class FeedGeneratorService
             $ads[] = $data;
             $catalogCount++;
         }
+
+        $replacementCount = 0;
+        foreach ($replacements as $ad) {
+            $data = $this->buildAdData($ad, 'active');
+            if ($data === null) {
+                continue;
+            }
+            $data['avito_id'] = '';
+            $ads[] = $data;
+            $replacementCount++;
+        }
+
+        $this->warnMissingBrandOem($ads);
 
         if (!is_dir($this->outputDir)) {
             mkdir($this->outputDir, 0755, true);
@@ -124,17 +152,17 @@ class FeedGeneratorService
 
         $this->writeXml($xmlPath, $ads);
 
-        if ($keepQueue) {
-            echo "  Очередь не изменена: кандидаты остались в таблице, дневной счётчик не увеличен\n";
-        } else {
+        if ($persist) {
             $this->consumeRemovalBatch($removalAds);
+        } else {
+            echo "  Тест: база не изменена. В файле старый Id уже заменён новым, очередь и дневной счётчик на месте\n";
         }
 
         $count = count($ads);
         echo "  XML: {$xmlPath}\n";
-        echo "  Снятие сверху: " . count($candidateAvitoIds) . "\n";
-        echo "  Каталог ниже:  {$catalogCount} (те же объявления, кандидаты внутри)\n";
-        echo "  Объявлений:    {$count}\n";
+        echo "  Переопубликовано: {$replacementCount} (старого Id в файле нет, есть новый без AvitoId)\n";
+        echo "  Остальной каталог: {$catalogCount}\n";
+        echo "  Объявлений:       {$count}\n";
 
         return [
             'file' => $xmlPath,
@@ -178,6 +206,8 @@ class FeedGeneratorService
             echo "  Нет объявлений для выгрузки\n";
             return $empty;
         }
+
+        $this->backfillListingContent($catalog);
 
         $keptAds = array_slice(array_values($catalog), 0, $keep);
         $ads = [];
@@ -308,10 +338,16 @@ class FeedGeneratorService
 
         $adIdMap = $this->resolveAutoloadIds(array_keys($byAvitoId));
 
-        $ads = [];
+        $hydratedAds = [];
         foreach ($byAvitoId as $item) {
             $hydrated = $this->hydrateApiItem($item, $adIdMap);
             $hydrated['_fallback_description'] = false;
+            $hydratedAds[] = $hydrated;
+        }
+        $this->backfillListingContent($hydratedAds);
+
+        $ads = [];
+        foreach ($hydratedAds as $hydrated) {
             $data = $this->buildAdData($hydrated, 'active');
             if ($data === null) {
                 continue;
@@ -469,8 +505,148 @@ class FeedGeneratorService
     }
 
     /**
+     * Новое поколение: новый unique_id, пустой avito_id, слегка другой контент.
+     * Старая строка уходит из каталога только при боевой генерации.
+     *
+     * @param array<string, mixed> $ad
+     * @param array<string, true> $reservedIds
+     * @return array<string, mixed>
+     */
+    private function spawnReplacement(array $ad, bool $persist, array &$reservedIds): array
+    {
+        $variation = (new AdContentVariation())->vary(
+            (string) ($ad['title'] ?? ''),
+            (string) ($ad['description'] ?? ''),
+            $this->parseImages($ad)
+        );
+
+        $baseId = (string) ($ad['unique_id'] ?? '');
+        if ($baseId === '') {
+            $baseId = (string) ($ad['avito_id'] ?? '');
+        }
+        if ($baseId === '') {
+            $baseId = 'ad_' . (string) ($ad['id'] ?? '0');
+        }
+        $newUniqueId = $this->nextUniqueId($baseId, $reservedIds);
+        $imagesJson = json_encode($variation['images'], JSON_UNESCAPED_UNICODE);
+
+        $master = [];
+        if (!empty($ad['master_data']) && is_string($ad['master_data'])) {
+            $decoded = json_decode($ad['master_data'], true);
+            if (is_array($decoded)) {
+                $master = $decoded;
+            }
+        }
+        $master['title'] = $variation['title'];
+        $master['description'] = $variation['description'];
+        $master['unique_id'] = $newUniqueId;
+        $master['images'] = $variation['images'];
+
+        $replacement = $ad;
+        $replacement['unique_id'] = $newUniqueId;
+        $replacement['avito_id'] = '';
+        $replacement['title'] = $variation['title'];
+        $replacement['description'] = $variation['description'];
+        $replacement['images'] = $imagesJson;
+        $replacement['status'] = 'active';
+        $replacement['old_avito_id'] = (string) ($ad['avito_id'] ?? '');
+
+        if (!$persist) {
+            return $replacement;
+        }
+
+        $oldAvitoId = (string) ($ad['avito_id'] ?? '');
+        $this->repository->beginWriteTransaction();
+        try {
+            $newId = $this->repository->createPhysical(
+                (string) ($ad['logical_key'] ?? ''),
+                $master,
+                'active'
+            );
+            $this->repository->updatePhysical($newId, [
+                'published_at' => date('Y-m-d H:i:s'),
+                'old_avito_id' => $oldAvitoId !== '' ? $oldAvitoId : null,
+                'unique_id' => $newUniqueId,
+                'phone' => $ad['phone'] ?? null,
+                'contact_method' => $ad['contact_method'] ?? null,
+                'brand' => $ad['brand'] ?? null,
+                'oem_number' => $ad['oem_number'] ?? null,
+                'images' => $imagesJson,
+                'title' => $variation['title'],
+                'description' => $variation['description'],
+                'location' => $ad['location'] ?? null,
+                'price' => $ad['price'] ?? 0,
+                'category_params' => $ad['category_params'] ?? null,
+            ]);
+            $oldId = (int) ($ad['id'] ?? 0);
+            if ($oldId > 0 && !$this->repository->archivePhysicalAd($oldId, true)) {
+                throw new \RuntimeException('Не удалось архивировать объявление ' . $oldId);
+            }
+            $this->repository->commit();
+        } catch (\Throwable $e) {
+            $this->repository->rollBack();
+            throw $e;
+        }
+
+        $stored = $this->repository->getById($newId);
+        if ($stored === null) {
+            return $replacement;
+        }
+        $stored['avito_id'] = '';
+
+        echo "  [REPUB] " . ($oldAvitoId !== '' ? $oldAvitoId : $baseId)
+            . " -> Id {$newUniqueId}\n";
+
+        return $stored;
+    }
+
+    /**
+     * @param array<string, true> $reservedIds
+     */
+    private function nextUniqueId(string $current, array &$reservedIds): string
+    {
+        if (preg_match('/^(.*)-v(\d+)$/', $current, $matches) === 1) {
+            $base = $matches[1];
+            $version = (int) $matches[2] + 1;
+        } else {
+            $base = $current;
+            $version = 2;
+        }
+
+        do {
+            $candidate = $base . '-v' . $version;
+            $version++;
+        } while (isset($reservedIds[$candidate]) || $this->repository->uniqueIdExists($candidate));
+
+        $reservedIds[$candidate] = true;
+
+        return $candidate;
+    }
+
+    /**
+     * @param list<array<string, mixed>> $ads
+     */
+    private function warnMissingBrandOem(array $ads): void
+    {
+        foreach ($ads as $ad) {
+            $missing = [];
+            if ((string) ($ad['brand'] ?? '') === '') {
+                $missing[] = 'Производитель';
+            }
+            if ((string) ($ad['oem'] ?? '') === '') {
+                $missing[] = 'Номер детали OEM';
+            }
+            if ($missing === []) {
+                continue;
+            }
+            echo '  [WARN] Id ' . ($ad['unique_id'] ?? '')
+                . ': пусто ' . implode(', ', $missing) . "\n";
+        }
+    }
+
+    /**
      * Следующие кандидаты из очереди, не больше дневного лимита.
-     * В каталоге они остаются и пишутся второй раз как активные.
+     * В файле их старый Id не пишется: вместо него идёт новое поколение.
      *
      * @param array<string, array<string, mixed>> $catalogByAvitoId
      * @param bool $ignoreDailyUsage Для тестового фида: взять полную порцию, даже если лимит дня уже занят
@@ -489,9 +665,9 @@ class FeedGeneratorService
         }
 
         if ($ignoreDailyUsage) {
-            echo "  Тестовый фид: снятие до {$slots}, уже использовано сегодня {$used} — в файл не входит и не списывается\n";
+            echo "  Тестовый фид: замена до {$slots}, уже использовано сегодня {$used} — в базу не пишется и не списывается\n";
         } else {
-            echo "  Лимит снятий сегодня: {$slots} из {$maxDaily} (уже использовано: {$used})\n";
+            echo "  Лимит переопубликации сегодня: {$slots} из {$maxDaily} (уже использовано: {$used})\n";
         }
         if ($slots === 0) {
             echo "  Очередь сегодня не берём, в файле только каталог\n";
@@ -527,7 +703,7 @@ class FeedGeneratorService
     }
 
     /**
-     * Порция, попавшая в блок снятия, списывается с дневного лимита и уходит из очереди.
+     * Порция, попавшая в замену, списывается с дневного лимита и уходит из очереди.
      *
      * @param list<array<string, mixed>> $removalAds
      */
@@ -612,6 +788,176 @@ class FeedGeneratorService
             'Название компании',
             'Почта',
         ];
+    }
+
+    /**
+     * Дописать пустые описание и фото из файла Автозагрузки.
+     * Поколение adsasdasd2395-v2 берёт текст и ссылки у adsasdasd2395.
+     *
+     * @param list<array<string, mixed>> $ads
+     */
+    private function backfillListingContent(array &$ads): void
+    {
+        $fromArchive = 0;
+        foreach ($ads as &$ad) {
+            $update = $this->repository->listingFieldsFromArchive($ad);
+            if ($update === []) {
+                continue;
+            }
+            foreach ($update as $column => $value) {
+                $ad[$column] = $value;
+            }
+            if (array_key_exists('logical_key', $ad) && (int) ($ad['id'] ?? 0) > 0) {
+                $this->repository->updatePhysical((int) $ad['id'], $update);
+            }
+            $fromArchive++;
+        }
+        unset($ad);
+        if ($fromArchive > 0) {
+            echo "  Из архива дописано объявлений: {$fromArchive}\n";
+        }
+
+        $missing = false;
+        foreach ($ads as $ad) {
+            if ($this->listingContentMissing($ad)) {
+                $missing = true;
+                break;
+            }
+        }
+        if (!$missing) {
+            return;
+        }
+
+        $path = $this->resolveAutoloadContentFile();
+        if ($path === null) {
+            echo "  Нет файла Автозагрузки с описанием и фото\n";
+            return;
+        }
+
+        echo "  Описание и фото из {$path}\n";
+        flush();
+        $index = (new AutoloadFeedImportService($this->apiClient, $this->repository, $this->config))
+            ->listingContentByUniqueId($path);
+        echo "  В файле объявлений с текстом или фото: " . count($index) . "\n";
+
+        $filled = 0;
+        foreach ($ads as &$ad) {
+            if (!$this->listingContentMissing($ad)) {
+                continue;
+            }
+            $content = $this->lookupListingContent($index, (string) ($ad['unique_id'] ?? ''));
+            if ($content === null) {
+                continue;
+            }
+
+            $update = [];
+            if (trim((string) ($ad['description'] ?? '')) === '' && $content['description'] !== '') {
+                $ad['description'] = $content['description'];
+                $update['description'] = $content['description'];
+            }
+            if (!$this->hasStoredImages((string) ($ad['images'] ?? '')) && $content['images'] !== '' && $content['images'] !== '[]') {
+                $ad['images'] = $content['images'];
+                $update['images'] = $content['images'];
+            }
+            if ($update === []) {
+                continue;
+            }
+
+            $this->persistListingContent($ad, $update);
+            $filled++;
+        }
+        unset($ad);
+
+        echo "  Дописано объявлений: {$filled}\n";
+    }
+
+    /**
+     * @param array<string, mixed> $ad
+     * @param array<string, string> $update
+     */
+    private function persistListingContent(array $ad, array $update): void
+    {
+        $id = 0;
+        if (array_key_exists('logical_key', $ad)) {
+            $id = (int) ($ad['id'] ?? 0);
+        } else {
+            $uniqueId = trim((string) ($ad['unique_id'] ?? ''));
+            if ($uniqueId !== '') {
+                $stored = $this->repository->getByUniqueId($uniqueId);
+                $id = (int) ($stored['id'] ?? 0);
+            }
+        }
+        if ($id > 0) {
+            $this->repository->updatePhysical($id, $update);
+        }
+    }
+
+    /**
+     * @param array<string, array{description: string, images: string}> $index
+     * @return array{description: string, images: string}|null
+     */
+    private function lookupListingContent(array $index, string $uniqueId): ?array
+    {
+        $uniqueId = trim($uniqueId);
+        if ($uniqueId === '') {
+            return null;
+        }
+        if (isset($index[$uniqueId])) {
+            return $index[$uniqueId];
+        }
+
+        $base = preg_replace('/-v\d+$/', '', $uniqueId) ?? $uniqueId;
+        if ($base !== $uniqueId && isset($index[$base])) {
+            return $index[$base];
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string, mixed> $ad
+     */
+    private function listingContentMissing(array $ad): bool
+    {
+        $description = trim((string) ($ad['description'] ?? ''));
+
+        return $description === '' || !$this->hasStoredImages((string) ($ad['images'] ?? ''));
+    }
+
+    private function hasStoredImages(string $imagesJson): bool
+    {
+        $imagesJson = trim($imagesJson);
+        if ($imagesJson === '' || $imagesJson === '[]') {
+            return false;
+        }
+
+        $decoded = json_decode($imagesJson, true);
+
+        return is_array($decoded) && $decoded !== [];
+    }
+
+    private function resolveAutoloadContentFile(): ?string
+    {
+        $outputDir = (string) ($this->config['feed']['output_dir'] ?? $this->outputDir);
+        $dir = (string) ($this->config['feed']['autoload_download_dir'] ?? ($outputDir . '/autoload'));
+        if (!is_dir($dir)) {
+            return null;
+        }
+
+        $files = array_merge(
+            glob($dir . '/*.xlsx') ?: [],
+            glob($dir . '/*.csv') ?: [],
+            glob($dir . '/*.xml') ?: []
+        );
+        if ($files === []) {
+            return null;
+        }
+
+        usort($files, static function (string $a, string $b): int {
+            return filemtime($b) <=> filemtime($a);
+        });
+
+        return $files[0];
     }
 
     /**

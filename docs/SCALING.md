@@ -1,59 +1,46 @@
 # Масштабирование на много аккаунтов Avito
 
-Как обернуть текущий одноаккаунтный контур в контекст аккаунта, стратегии переопубликации, отдельную БД и фид на аккаунт, выгрузку в объектное хранилище и проекцию статистики в Google Sheets — без переписывания уже работающего пайплайна.
+Отдельная база и отдельный фид на кабинет уже работают. Готовый XML уходит на опубликованный файл Яндекс.Диска этого кабинета (`run`). Отдельный бакет и проекция в Google Sheets в коде ещё нет.
 
-Код по этому документу не меняется, пока одноаккаунтный контур не стабилизирован. Ниже — целевая схема и порядок внедрения.
+Корневые команды (`php index.php run`, `feed`, `collect-stats`) по-прежнему открывают один контур: `.env`, `data/avito.db`, `fid/`. Этот кабинет в реестр сам не переносится.
 
 ## Что есть сейчас
 
-Один аккаунт зашит в четырёх местах:
+Изоляция физическая. [ItemRepository](../src/Repositories/ItemRepository.php) по-прежнему видит один файл и не знает про `account_id`. `avito_id` и `unique_id` уникальны внутри этого файла.
 
-- `.env` и [config/avito.php](../config/avito.php): один `AVITO_CLIENT_ID` / `SECRET` / `USER_ID`.
-- [index.php](../index.php): один `PDO` на `data/avito.db`, один `AvitoAPIClient`, один `ItemRepository`.
-- [src/Services/FeedGeneratorService.php](../src/Services/FeedGeneratorService.php): один файл `fid/avito_feed_YYYY-MM-DD.csv`. Дневной счётчик — глобальный ключ `app_meta.feed_repub_YYYY-MM-DD`.
-- [src/Repositories/ItemRepository.php](../src/Repositories/ItemRepository.php): в `physical_ads`, `stats`, секциях `stats_YYYY_MM` и `republish_candidates_YYYY_MM` нет `account_id`. `avito_id` и `unique_id` живут в одном пространстве.
+- Корневой кабинет: `.env`, [config/avito.php](../config/avito.php), `data/avito.db`, `fid/avito_feed_YYYY-MM-DD.xml`.
+- Кабинет из реестра: `config/accounts/{code}.env`, `data/accounts/{code}/avito.db`, `fid/{code}/avito_feed_YYYY-MM-DD.xml`.
+- [index.php](../index.php) не собирает клиент сам. Команду разбирает [CommandDispatcher](../src/Cli/CommandDispatcher.php), а объекты на один прогон собирает [AccountRuntime](../src/Accounts/AccountRuntime.php).
+- Дневной счётчик `app_meta.feed_repub_YYYY-MM-DD` лежит в файле того кабинета, который сейчас открыт.
 
-Уже есть зачатки нужных границ: сервисы (`PipelineService`, `AnalysisService`, `FeedGeneratorService`), репозиторий, DTO правил (`AnalysisRuleDTO`). Их не выбрасываем. `ItemRepository` (~1700 строк) остаётся внутри аккаунта: туда не добавляем мультиарендность построчно.
+Сервисы (`AnalysisService`, `FeedGeneratorService`) и репозиторий не переписывались под мультиарендность. Им подставляют другой DSN и другой `feed.output_dir`.
 
-Автозагрузка сейчас только читает отчёт Авито (`GET /autoload/v4/uploads` в [AvitoAPIClient](../src/Services/AvitoAPIClient.php)). Выгрузки готового фида в облако в коде нет. Эндпоинт `POST /autoload/v1/.../feed/upload` из [REPUBLISH_PLAN.md](../REPUBLISH_PLAN.md) не используем, пока он не сверен со Swagger: рабочая схема Авито — кабинет сам забирает файл по URL.
+Автозагрузка читает отчёт Авито (`GET /autoload/v4/uploads` в [AvitoAPIClient](../src/Services/AvitoAPIClient.php)). Готовый XML `run` перезаписывает на Яндекс.Диске; публичная ссылка берётся из env кабинета. Кабинет Авито сам забирает файл по URL, отдельной загрузки фида через API нет. Настройка Диска — в [README](../README.md), раздел «Яндекс.Диск».
 
 ```mermaid
 flowchart LR
-  env[".env один аккаунт"] --> client[AvitoAPIClient]
-  client --> repo[ItemRepository]
-  repo --> db["data/avito.db"]
-  repo --> feed["fid/avito_feed_date.csv"]
+  cli["php index.php account code feed"] --> registry[AccountRegistry]
+  registry --> control["data/control.db"]
+  registry --> envFile["config/accounts/code.env"]
+  registry --> runtime[AccountRuntime]
+  runtime --> repo[ItemRepository]
+  repo --> db["data/accounts/code/avito.db"]
+  repo --> feed["fid/code/avito_feed_date.xml"]
 ```
 
-## Целевая схема
+Корневой запуск ту же схему проходит без реестра: `AccountRuntime::openLegacy` берёт `.env` и `data/avito.db`.
 
-Каждый аккаунт — замкнутый контур: свои ключи, свой файл SQLite, свой каталог фида, свой URL в облаке, своя строка в сводке Sheets. Общий код только оркестрирует.
+## Паттерны
 
-```mermaid
-flowchart TB
-  cli["php index.php account slug run"] --> runner[AccountRunner]
-  runner --> registry[AccountRegistry]
-  registry --> ctx[AccountContext]
-  ctx --> factory[AvitoClientFactory]
-  ctx --> db["data/accounts/slug/avito.db"]
-  ctx --> strategy[RepublishStrategy]
-  strategy --> pipeline[текущий PipelineService]
-  pipeline --> storage[FeedStorage]
-  storage --> local["fid/slug/feed.csv"]
-  storage --> s3["bucket/feeds/slug/latest.csv"]
-  pipeline --> sheets[SheetsProjection]
-```
+Оболочка вокруг уже работающих классов. SQL репозитория не стал мультиарендным.
 
-## Паттерны, которые стоит ввести
+- **AccountContext.** Код, ключи, путь к базе, каталог фида, необязательный `max_daily_repub`. Сервисы читают уже наложенный конфиг, а не чужой `.env`.
+- **AccountRegistry.** Метаданные в `data/control.db`. Секреты остаются в env-файле.
+- **AccountRuntime.** На один прогон собирает PDO, `AvitoAPIClient`, репозиторий и контроллер. Токен OAuth живёт в этом клиенте и не переходит к следующему кабинету: соединение закрывается до следующей итерации.
+- **CommandDispatcher.** Один разбор команд и для корневого запуска, и для `account {code}`.
+- **Наложение конфига.** Паузы, пороги и категория фида остаются в `config/avito.php`. Контекст подменяет ключи API, DSN, `feed.output_dir` и каталог скачанной выгрузки. Корневой `fid/autoload/` кабинету из реестра не отдаётся.
 
-Не полный рефакторинг, а тонкая оболочка вокруг уже работающих классов.
-
-- **AccountContext.** Объект аккаунта: `code`, `user_id`, путь к БД, каталог фида, лимиты, имя стратегии. Все сервисы получают его, а не глобальный `$config['avito']`.
-- **Factory.** `AvitoClientFactory` собирает `AvitoAPIClient` из учётных данных конкретного аккаунта. Токен остаётся в памяти клиента, как сейчас, и не шарится между аккаунтами.
-- **Strategy.** Интерфейс `RepublishStrategy` с методом отбора кандидатов. Первая реализация — нынешние `analysis_thresholds` и `findZeroViewCandidates()`. Новые стратегии добавляются классом и именем в реестре, без правок пайплайна и фида. Фид по-прежнему один: сверху порция снятия, ниже весь каталог.
-- **Pipeline как набор шагов.** `sync → stats → candidates → feed → publish → project`. `PipelineService` уже почти так устроен. Шаги получают контекст аккаунта. Стратегия подменяется только на шаге candidates.
-- **Port для фида.** `FeedStorage`: `LocalFeedStorage` (сейчас) и `ObjectStorageFeedStorage` (S3-совместимое, Яндекс Object Storage). Генератор пишет файл и не знает, куда его потом кладут.
-- **Проекция, не источник правды.** Google Sheets читает агрегаты из БД после прогона. Обратно в БД из таблицы ничего не пишем.
+Ещё не сделано: интерфейс стратегии отбора кандидатов, выгрузка в отдельный бакет, таблица прогонов `account_runs` и запись в Google Sheets. Яндекс.Диск на кабинет уже есть: ссылка и токен в его env, команды `run` и `run-r`.
 
 ## База
 
@@ -61,32 +48,26 @@ flowchart TB
 
 Решение на этот масштаб — **файл на аккаунт**, схема внутри файла та же, что уже работает:
 
-- Реестр: `data/control.db`, таблица `accounts` (`code`, `user_id`, `db_path`, `feed_dir`, `strategy`, `enabled`, `max_daily_repub`, `sheets_spreadsheet_id`). Секреты в реестр не класть.
-- Данные: `data/accounts/{code}/avito.db`. Туда переносится текущая схема без колонки `account_id`: изоляция физическая, SQL репозитория не переписывается.
-- Секреты: `config/accounts/{code}.env` (в `.gitignore`), поля те же три, что сейчас в корневом `.env`. Корневой `.env` остаётся для текущего аккаунта, пока его не перенесут в реестр как `code=default`.
+- Реестр: `data/control.db`, таблица `accounts` (`code`, `label`, `user_id`, `db_path`, `feed_dir`, `env_file`, `enabled`, `max_daily_repub`, `created_at`). Секретов в ней нет. `user_id` копируется из env при `account list` и при запуске команды. Пустой `max_daily_repub` означает лимит из `config/avito.php`.
+- Данные: `data/accounts/{code}/avito.db`. Схема та же, без `account_id`. Файл создаёт `ItemRepository` при первой команде кабинета, не при `account add`. Строки из `data/avito.db` не копируются.
+- Секреты: `config/accounts/{code}.env` (в `.gitignore`): ключи Авито и поля Яндекс.Диска. Корневой `.env` остаётся у команд без `account`. Ссылка и токен Диска из корневого файла в кабинет реестра не копируются.
+- Код кабинета: `^[a-z0-9][a-z0-9_-]{0,40}$`. Путь базы только внутри `data/accounts/{code}/`, фид только внутри `fid/{code}/`, ключи только в `config/accounts/{code}.env`. Чужой путь из реестра команда не открывает.
 
 Общий Postgres с `account_id` на каждой таблице — следующий шаг, и только если понадобятся одновременные писатели или один SQL по всем кабинетам. Путь миграции: выгрузить каждый файл в схему с `account_id`. До этого момента не смешивать объявления в одной таблице.
 
-Сводка по аккаунтам для Sheets пишется в `control.db` (`account_runs`: дата, число объявлений, кандидатов, снятых за день, статус фида, URL). Детальная статистика остаётся в файле аккаунта.
+Сводка по аккаунтам для Sheets в `control.db` ещё не пишется. Детальная статистика остаётся в файле аккаунта.
 
-## Фиды и облако
+## Фиды
 
-Пересечения не будет, если три правила держатся вместе:
+Локальные файлы уже разведены:
 
-- Файл только в `fid/{code}/avito_feed_YYYY-MM-DD.csv`. Имя без кода аккаунта больше не используем.
-- Объект в бакете: `feeds/{code}/avito_feed_YYYY-MM-DD.csv` и копия `feeds/{code}/latest.csv`.
-- В кабинете Авито у каждого аккаунта свой URL автозагрузки на свой `latest.csv`. Авито забирает файл сам. После прогона смотрим отчёт тем же `getUploads()` / `getLastSuccessfulUpload()`, но клиентом этого аккаунта.
+- Корневой кабинет: `fid/avito_feed_YYYY-MM-DD.xml`.
+- Кабинет из реестра: `fid/{code}/avito_feed_YYYY-MM-DD.xml`. Имя файла то же, каталог другой.
+- В кабинете Авито у каждого аккаунта свой URL автозагрузки на свой файл. Авито забирает файл сам.
+
+`php index.php account {code} run` пишет `fid/{code}/avito_feed_YYYY-MM-DD.xml` и перезаписывает файл по `YANDEX_DISK_PUBLIC_URL` из env этого кабинета. `run-r` оставляет файл только в `fid/{code}/`. Отдельного бакета нет.
 
 `Id` объявления в фиде уникален внутри аккаунта. Общий файл или общий URL смешает кабинеты: автозагрузка снимет всё, чего в её файле нет.
-
-## Google Sheets
-
-Источник правды — SQLite. Таблица — витрина.
-
-- Один spreadsheet. Лист `Сводка`: одна строка на аккаунт и дату (активные, кандидаты, снято сегодня, просмотры, контакты, избранное, статус последней автозагрузки, URL фида).
-- Лист на аккаунт — только если нужна детализация; на 50 кабинетов сводки достаточно для старта.
-- Доступ через сервисный аккаунт Google, JSON ключа вне git. Запись пакетом (batch update), идемпотентно по паре аккаунт+дата.
-- Запуск после успешного фида, отдельной командой `php index.php account {code} sheets`, чтобы сбой таблицы не откатывал фид.
 
 ## Лимиты и расписание
 
@@ -94,14 +75,15 @@ flowchart TB
 
 - Планировщик гоняет аккаунты по очереди, не параллельно, пока у них разные `client_id` не проверены на независимые квоты.
 - Ежедневный прогон берёт короткое окно статистики (`stats_days`, сейчас 3), не 30.
-- У каждого аккаунта свой `max_daily_repub`. Счётчик `feed_repub_*` живёт в его файле БД и сам по себе не пересекается.
-- Команда: `php index.php accounts run` — все `enabled`; `php index.php account {code} run` — один.
+- Счётчик `feed_repub_*` живёт в файле открытого кабинета и сам не пересекается с другим файлом. Свой `max_daily_repub` можно положить в колонку реестра; пока она пустая, берётся значение из `config/avito.php`. Команды, которая меняет эту колонку, нет.
+- `php index.php accounts run` — все `enabled`, по очереди. `php index.php account {code} run` — один. Ошибка одного кабинета не останавливает остальных.
 
-## Порядок внедрения
+Добавление кабинета и команды — в [README](../README.md), раздел «Несколько аккаунтов».
 
-1. Этот документ. Код не трогать.
-2. После стабилизации одноаккаунтного фида: реестр, `AccountContext`, фабрика клиента, CLI `account`. Текущий `.env` становится аккаунтом `default`. Поведение одного аккаунта не меняется.
-3. Каталог фида `fid/{code}/` и `FeedStorage`. Локальная запись. Облако — вторым адаптером, URL прописывается в кабинете вручную на первом аккаунте и проверяется отчётом автозагрузки.
-4. Стратегии: вынести текущие пороги в первую стратегию, пайплайн вызывает интерфейс.
-5. Проекция в Sheets из `account_runs`.
-6. Postgres — только по отдельному решению, когда файлов на аккаунт перестанет хватать.
+## Что ещё не сделано
+
+1. Отдельный бакет с постоянным `latest`. Яндекс.Диск на кабинет уже перезаписывает опубликованный файл.
+2. Стратегии: вынести текущие пороги в первую стратегию, пайплайн вызывает интерфейс.
+3. Проекция в Sheets из будущей `account_runs`.
+4. Регистрация текущего кабинета в общий обход с явными путями на уже существующие `data/avito.db` и `fid/`, без копирования файла. Сейчас его запускают только без префикса `account`.
+5. Postgres — только если понадобятся одновременные писатели или один SQL по всем кабинетам. До этого объявления в одной таблице не смешивать.
